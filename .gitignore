@@ -1,0 +1,5 @@
+# Everything build.sh downloads, converts or compiles.
+build/
+
+# macOS folder metadata.
+.DS_Store

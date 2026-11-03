@@ -1,0 +1,60 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 Aditya Kar
+//
+// Multiplies the source by the RVM alpha matte. The source arrives
+// premultiplied, so scaling all four channels keeps it premultiplied. The
+// matte texture's second channel marks where to remove the chair's colour
+// spill.
+
+uniform float4x4 ViewProj;
+uniform texture2d image;
+uniform texture2d matte;
+// Matte values below alpha_low become fully transparent and values above
+// alpha_high fully opaque; values in between are eased with smoothstep.
+uniform float alpha_low;
+uniform float alpha_high;
+
+sampler_state textureSampler {
+	Filter    = Linear;
+	AddressU  = Clamp;
+	AddressV  = Clamp;
+};
+
+struct VertData {
+	float4 pos : POSITION;
+	float2 uv  : TEXCOORD0;
+};
+
+VertData VSDefault(VertData v_in)
+{
+	VertData vert_out;
+	vert_out.pos = mul(float4(v_in.pos.xyz, 1.0), ViewProj);
+	vert_out.uv  = v_in.uv;
+	return vert_out;
+}
+
+float4 PSMatte(VertData v_in) : TARGET
+{
+	float4 rgba = image.Sample(textureSampler, v_in.uv);
+	float2 m = matte.Sample(textureSampler, v_in.uv).rg;
+	float a = smoothstep(alpha_low, alpha_high, m.r);
+
+	// Near a removed chair, leftover pixels with the chair's magenta tint
+	// (more blue than green) have their red pulled down to their other
+	// channels, so they read as neutral shadow rather than a red fringe.
+	// Skin has more green than blue and is left alone.
+	float magenta = saturate((rgba.b - rgba.g) * 8.0);
+	float neutral_red = min(rgba.r, max(rgba.g, rgba.b));
+	rgba.r = lerp(rgba.r, neutral_red, m.g * magenta);
+
+	return rgba * a;
+}
+
+technique Draw
+{
+	pass
+	{
+		vertex_shader = VSDefault(v_in);
+		pixel_shader  = PSMatte(v_in);
+	}
+}

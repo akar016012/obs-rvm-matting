@@ -1,0 +1,46 @@
+name: Bug report
+description: Report something that does not work as described.
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: Thank you for the report. Please do not include screenshots that show other people or anything private in your room.
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: Describe what you saw and what you expected instead. A cropped screenshot or a short recording helps with edge problems.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: How can it be reproduced?
+      description: List the steps that lead to the problem.
+    validations:
+      required: true
+  - type: input
+    id: mac
+    attributes:
+      label: Mac and macOS version
+      placeholder: Apple M2 Pro, macOS 15.1
+    validations:
+      required: true
+  - type: input
+    id: obs
+    attributes:
+      label: OBS version
+      placeholder: "33.0.0"
+    validations:
+      required: true
+  - type: textarea
+    id: settings
+    attributes:
+      label: Filter settings
+      description: Give at least the Model and Run on settings, and any setting you changed from its default.
+  - type: textarea
+    id: log
+    attributes:
+      label: Log lines
+      description: Paste the lines that start with [rvm-matting] from the OBS log (Help, Log Files, Show Log Files).
+      render: text

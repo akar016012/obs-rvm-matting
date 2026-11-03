@@ -1,0 +1,21 @@
+name: Feature request
+description: Suggest an improvement or a new setting.
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem would this solve?
+      description: Describe the situation where the filter falls short today.
+    validations:
+      required: true
+  - type: textarea
+    id: idea
+    attributes:
+      label: What would you like to happen?
+      description: Describe the change you have in mind, if you have one.
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: What have you tried instead?
+      description: List any settings or workarounds you have already tried.
