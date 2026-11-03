@@ -3,3 +3,6 @@ build/
 
 # macOS folder metadata.
 .DS_Store
+
+# Personal settings that stay on this machine.
+local/

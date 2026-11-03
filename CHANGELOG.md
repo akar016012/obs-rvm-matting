@@ -4,6 +4,11 @@ All notable changes to this project are recorded in this file. The format follow
 
 ## Unreleased
 
+### Added
+
+- **Automatic color** corrects brightness from the scene's highlights and white balance from plain background areas, gradually, without letting skin set the white balance.
+- A debug snapshot now also logs the camera's raw color (skin, bright background, dark clothing and brightness spread), for tuning OBS's color correction without saving the picture.
+
 ## 1.0.0 - 2026-11-03
 
 ### Added

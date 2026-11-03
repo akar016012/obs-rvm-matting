@@ -26,6 +26,7 @@
 #include <obs-module.h>
 #include <util/platform.h>
 #include <util/threading.h>
+#include <graphics/vec3.h>
 
 OBS_DECLARE_MODULE()
 OBS_MODULE_USE_DEFAULT_LOCALE("obs-rvm-matting", "en-US")
@@ -37,7 +38,7 @@ OBS_MODULE_USE_DEFAULT_LOCALE("obs-rvm-matting", "en-US")
 // Recurrent states are reset when frames stop arriving for this long, so a
 // paused or reconnected camera does not start from stale memory.
 static const double kStateResetGapSeconds = 1.0;
-// Inference timings are summarised in the OBS log at this interval.
+// Inference timings are summarized in the OBS log at this interval.
 static const double kStatsIntervalSeconds = 30.0;
 // A requested matte snapshot waits this many mattes, so the model's
 // recurrent state has settled before the image is written.
@@ -73,11 +74,11 @@ static const uint64_t kSyncGiveUpNs = 500000000ULL;
 // they do, new frames are not sent to the model.
 static const int kMaxPostPending = 2;
 // A photo of the empty background is compared with each frame. Where the
-// average colour difference is at most kPlateMatchLow levels the pixel is
+// average color difference is at most kPlateMatchLow levels the pixel is
 // background and is cut out; from kPlateMatchHigh up it is left to the model.
 static const float kPlateMatchLow = 10.0f;
 static const float kPlateMatchHigh = 28.0f;
-// The colour difference is averaged over this many pixels (odd) to ignore
+// The color difference is averaged over this many pixels (odd) to ignore
 // camera noise.
 static const vImagePixelCount kPlateBlur = 5;
 // The solid middle of the person, shrunk by this many motion-grid cells
@@ -85,11 +86,11 @@ static const vImagePixelCount kPlateBlur = 5;
 // match what is behind them keep no holes.
 static const vImagePixelCount kCoreShrink = 9;
 // Where the model is sure it sees background and nothing moves, the photo
-// drifts towards the live picture by 1/16 per matte, following lighting.
+// drifts toward the live picture by 1/16 per matte, following lighting.
 static const int kPlateAdaptShift = 4;
 // The photo is taken this long after the capture button is clicked.
 static const double kPlateCaptureDelaySeconds = 5.0;
-// Chair removal: a colour counts as chair once (red - green) / red reaches
+// Chair removal: a color counts as chair once (red - green) / red reaches
 // kChairRednessLow and fully at kChairRednessHigh, and only when red is at
 // least kChairMinRed, so the black rim and shadows are not chair on their own.
 static const float kChairRednessLow = 0.35f;
@@ -114,6 +115,31 @@ static const vImagePixelCount kChairFineBlur = 3;
 // than kChairSliver pixels (odd) are removed, which takes the leftover rim.
 static const vImagePixelCount kChairCleanupReach = 41;
 static const vImagePixelCount kChairSliver = 9;
+// Automatic color: every kAutoColorEvery mattes the frame is measured to set
+// new targets, and on every matte the color moves kAutoColorRate of the way
+// toward them. Small steps on every frame settle over a few seconds without
+// any visible jumps.
+static const int kAutoColorEvery = 15;
+static const float kAutoColorRate = 0.02f;
+// Exposure is set from the background's highlights, never from the person,
+// so every skin tone keeps its own brightness: the background's
+// 98th-percentile brightness (in linear light) is brought to
+// kAutoHighlightTarget, within kAutoGainMin..Max.
+static const float kAutoHighlightTarget = 0.80f;
+static const float kAutoGainMin = 0.7f;
+static const float kAutoGainMax = 3.0f;
+// White balance makes plain background areas (walls) neutral. It needs at
+// least this share of the measured pixels, and each channel's correction
+// stays within kAutoBalanceMin..Max.
+static const float kAutoBalanceMinShare = 0.005f;
+static const float kAutoBalanceMin = 0.75f;
+static const float kAutoBalanceMax = 1.33f;
+// After the gain, mid-tones are lifted with this power in linear light, much
+// like a phone camera's tone curve.
+static const float kAutoColorLift = 0.8f;
+// Exposure is measured on the background when it makes up at least this
+// share of the frame, and on the whole frame otherwise.
+static const float kAutoBackgroundMinShare = 0.05f;
 
 // Both models take 1920x1080 frames and return a 1920x1080 matte; see
 // tools/convert_model.py.
@@ -133,7 +159,7 @@ struct edge_flicker {
 
 @interface RVMEngine : NSObject
 @property (atomic) BOOL busy;
-@property (atomic) BOOL cancelled;
+@property (atomic) BOOL canceled;
 // 0 turns the steadying off; 1 damps edge flicker the most.
 @property (atomic) float stability;
 // Timestamp of the frame behind the newest matte, or 0 before the first.
@@ -144,6 +170,15 @@ struct edge_flicker {
 @property (atomic) BOOL usePlate;
 // Whether a red chair behind the person is always cut out.
 @property (atomic) BOOL removeChair;
+// Whether exposure and white balance are corrected automatically.
+@property (atomic) BOOL autoColor;
+// The current automatic color state: red, green and blue gains in linear
+// light, then the mid-tone lift. It fades to 1, 1, 1, 1 while automatic
+// color is off.
+- (void)getColorState:(float *)state;
+// Starts from another engine's state, so a model change keeps the color.
+// Call it before the engine is given any frames.
+- (void)setColorState:(const float *)state;
 // The photo is loaded from and saved to platePath.
 - (instancetype)initWithModelPath:(NSString *)path
 		     computeUnits:(MLComputeUnits)units
@@ -220,7 +255,7 @@ struct edge_flicker {
 	BOOL _motionValid;
 
 	// Owned by the publish queue: the empty-background photo (BGRA at the
-	// model size) and the blurred colour difference to it.
+	// model size) and the blurred color difference to it.
 	NSString *_platePath;
 	uint8_t *_plate;
 	uint8_t *_plateDiff;
@@ -264,6 +299,14 @@ struct edge_flicker {
 	double _statsRawChange;
 	double _statsChange;
 	struct edge_flicker _statsEdge;
+
+	// Automatic color. The gains and the lift are smoothed on the publish
+	// queue and read by the renderer under _colorLock.
+	int _autoColorCountdown;
+	float _colorTarget[4]; // publish queue only: gains, then lift
+	float _colorGains[3];
+	float _colorLift;
+	NSLock *_colorLock;
 }
 
 - (instancetype)initWithModelPath:(NSString *)path
@@ -276,6 +319,10 @@ struct edge_flicker {
 	_queue = dispatch_queue_create("rvm-matting.inference", DISPATCH_QUEUE_SERIAL);
 	_postQueue = dispatch_queue_create("rvm-matting.publish", DISPATCH_QUEUE_SERIAL);
 	_matteLock = [NSLock new];
+	_colorLock = [NSLock new];
+	_colorGains[0] = _colorGains[1] = _colorGains[2] = 1.0f;
+	_colorLift = 1.0f;
+	_colorTarget[0] = _colorTarget[1] = _colorTarget[2] = _colorTarget[3] = 1.0f;
 
 	MLModelConfiguration *config = [MLModelConfiguration new];
 	config.computeUnits = units;
@@ -460,7 +507,7 @@ static void copy_plane(uint8_t *dst, size_t dst_stride, const uint8_t *src, size
 
 - (BOOL)submitFrame:(const struct obs_source_frame *)frame
 {
-	if (self.cancelled)
+	if (self.canceled)
 		return NO;
 	if (![self acceptsFrame:frame]) {
 		if (!_loggedFrameFormat)
@@ -595,7 +642,7 @@ static void copy_plane(uint8_t *dst, size_t dst_stride, const uint8_t *src, size
 	vImageMin_Planar8(&core_source, &core, NULL, 0, 0, kCoreShrink, kCoreShrink, kvImageEdgeExtend);
 }
 
-// One adaptation step towards the live picture, rounded to the nearest level.
+// One adaptation step toward the live picture, rounded to the nearest level.
 static inline int adapt_step(int d)
 {
 	const int half = 1 << (kPlateAdaptShift - 1);
@@ -698,7 +745,7 @@ static CGContextRef create_bgra_context(void *data, size_t width, size_t height)
 	uint32_t gh = height / kMotionGridScale;
 	BOOL have_motion = _motionValid && _gridWidth == gw && _gridHeight == gh;
 
-	// Colour difference to the photo, and slow adaptation of the photo where
+	// Color difference to the photo, and slow adaptation of the photo where
 	// the model is sure this is background and the picture is still.
 	for (uint32_t y = 0; y < height; y++) {
 		const uint8_t *p = frame + y * stride;
@@ -742,9 +789,9 @@ static CGContextRef create_bgra_context(void *data, size_t width, size_t height)
 
 #pragma mark Chair keeping
 
-// How strongly a colour looks like the red chair mesh, from 0 to 1. Skin
-// can be as red as the mesh under a webcam, but its red leans towards
-// orange (more green than blue), while the mesh leans towards magenta (more
+// How strongly a color looks like the red chair mesh, from 0 to 1. Skin
+// can be as red as the mesh under a webcam, but its red leans toward
+// orange (more green than blue), while the mesh leans toward magenta (more
 // blue than green). Wood leans orange too.
 static inline float chair_score(int r, int g, int b)
 {
@@ -756,7 +803,7 @@ static inline float chair_score(int r, int g, int b)
 	return fminf(1.0f, fmaxf(0.0f, fminf(fminf(redness, magenta), brightness)));
 }
 
-// Removes the red chair: chair-coloured pixels outside the person's solid
+// Removes the red chair: chair-colored pixels outside the person's solid
 // middle are cut out, however sure the model is that they belong to the
 // person. Runs on the publish queue with the raw matte, before smoothing.
 - (void)applyChairTo:(uint8_t *)matte width:(uint32_t)width height:(uint32_t)height frame:(CVPixelBufferRef)bgra
@@ -814,7 +861,7 @@ static inline float chair_score(int r, int g, int b)
 			// A partial score already removes most of the pixel, so mesh
 			// that scores only part way still disappears.
 			int amount = MIN(255, (int)c[x] * 3 / 2);
-			// Where the model leans towards the person, the wide blur is not
+			// Where the model leans toward the person, the wide blur is not
 			// enough: red smeared onto a black earcup next to the chair
 			// would bite into it. Such pixels are cut only as far as
 			// they look like chair themselves. The mesh's black threads that
@@ -855,7 +902,7 @@ static inline float chair_score(int r, int g, int b)
 
 - (void)runModelOn:(CVPixelBufferRef)input timestamp:(uint64_t)timestamp
 {
-	if (self.cancelled)
+	if (self.canceled)
 		return;
 
 	double now = CFAbsoluteTimeGetCurrent();
@@ -906,7 +953,7 @@ static inline float chair_score(int r, int g, int b)
 			self->_smoothValid = NO;
 			self->_motionValid = NO;
 		}
-		if (!self.cancelled) {
+		if (!self.canceled) {
 			[self updateMotionFrom:bgra];
 			[self storeMatte:pha frame:bgra timestamp:timestamp];
 			[self recordTiming:ms];
@@ -918,7 +965,7 @@ static inline float chair_score(int r, int g, int b)
 }
 
 // Damps changes in the matte where the camera picture is still. Each pixel
-// moves towards the new value by a weight that is small where nothing moved
+// moves toward the new value by a weight that is small where nothing moved
 // (so the model's wavering settles) and 1 where the picture moved (so the
 // cutout follows at once). raw and previous are the unblurred mattes of this
 // frame and the last, used only for the edge flicker statistic. Returns the
@@ -1047,7 +1094,7 @@ static double smooth_matte(float *smoothed, const uint8_t *incoming, const uint8
 	_matteGeneration++;
 	int slot = (int)(_matteGeneration % MATTE_SLOTS);
 	// Each slot pixel holds the matte and, second, how strongly to remove the
-	// chair's colour spill there (only near where the chair was cut).
+	// chair's color spill there (only near where the chair was cut).
 	uint8_t *dst = _slots[slot];
 	const uint8_t *spill = _chairMaskValid ? _chairNear : NULL;
 	for (size_t i = 0; i < count; i++) {
@@ -1064,8 +1111,216 @@ static double smooth_matte(float *smoothed, const uint8_t *incoming, const uint8
 	[_matteLock unlock];
 	self.latestMatteTimestamp = timestamp;
 
-	if (snapshot)
+	if (snapshot) {
 		[self writeMatteSnapshotTo:snapshot];
+		[self logColorStatsOf:bgra];
+	}
+
+	if (--_autoColorCountdown <= 0) {
+		_autoColorCountdown = kAutoColorEvery;
+		if (self.autoColor) {
+			[self updateAutoColorFrom:bgra];
+		} else {
+			for (int c = 0; c < 4; c++)
+				_colorTarget[c] = 1.0f;
+		}
+	}
+	[self moveColorToward:_colorTarget];
+}
+
+// Moves the color state a step toward target (gains, then lift). Values
+// that are almost there snap to it, so "off" ends at exactly no change.
+- (void)moveColorToward:(const float *)target
+{
+	[_colorLock lock];
+	float *state[4] = {&_colorGains[0], &_colorGains[1], &_colorGains[2], &_colorLift};
+	for (int c = 0; c < 4; c++) {
+		*state[c] += (target[c] - *state[c]) * kAutoColorRate;
+		if (fabsf(target[c] - *state[c]) < 0.002f)
+			*state[c] = target[c];
+	}
+	[_colorLock unlock];
+}
+
+static float srgb_to_linear(int v)
+{
+	static float table[256];
+	static dispatch_once_t once;
+	dispatch_once(&once, ^{
+		for (int i = 0; i < 256; i++) {
+			float c = (float)i / 255.0f;
+			table[i] = c <= 0.04045f ? c / 12.92f : powf((c + 0.055f) / 1.055f, 2.4f);
+		}
+	});
+	return table[v];
+}
+
+// Measures the frame and sets new color targets: exposure from the
+// background's highlights and white balance from plain background areas.
+// Skin never sets the white balance, and sets the brightness only when
+// almost no background is visible. Runs on the publish queue.
+- (void)updateAutoColorFrom:(CVPixelBufferRef)bgra
+{
+	uint32_t width = (uint32_t)CVPixelBufferGetWidth(bgra);
+	uint32_t height = (uint32_t)CVPixelBufferGetHeight(bgra);
+	if (!_smoothed || width != _smoothWidth || height != _smoothHeight)
+		return;
+
+	double neutral[3] = {0};
+	uint64_t neutral_n = 0, total = 0;
+	// Brightness of unclipped pixels: background only, and the whole frame
+	// as a fallback when the person fills almost all of it.
+	uint64_t hist[256] = {0}, hist_all[256] = {0};
+	CVPixelBufferLockBaseAddress(bgra, kCVPixelBufferLock_ReadOnly);
+	const uint8_t *base = CVPixelBufferGetBaseAddress(bgra);
+	size_t stride = CVPixelBufferGetBytesPerRow(bgra);
+	for (uint32_t y = 0; y < height; y += 4) {
+		for (uint32_t x = 0; x < width; x += 4) {
+			const uint8_t *p = base + y * stride + (size_t)x * 4;
+			int b = p[0], g = p[1], r = p[2];
+			int luma = (54 * r + 183 * g + 19 * b) >> 8;
+			int spread = MAX(r, MAX(g, b)) - MIN(r, MIN(g, b));
+			total++;
+			float m = _smoothed[(size_t)y * width + x];
+			// Clipped pixels say nothing about exposure. The person is left
+			// out, so skin never sets the brightness.
+			if (MAX(r, MAX(g, b)) < 250) {
+				hist_all[luma]++;
+				if (m < 128.0f)
+					hist[luma]++;
+			}
+			if (m <= 5.0f && luma > 60 && MAX(r, MAX(g, b)) < 245 && spread < 40) {
+				neutral[0] += srgb_to_linear(r);
+				neutral[1] += srgb_to_linear(g);
+				neutral[2] += srgb_to_linear(b);
+				neutral_n++;
+			}
+		}
+	}
+	CVPixelBufferUnlockBaseAddress(bgra, kCVPixelBufferLock_ReadOnly);
+
+	// White balance: make the plain background neutral, keeping green fixed.
+	float balance[3] = {1.0f, 1.0f, 1.0f};
+	if (neutral_n >= (uint64_t)(kAutoBalanceMinShare * (float)total) && neutral[0] > 0 && neutral[2] > 0) {
+		balance[0] = fminf(kAutoBalanceMax, fmaxf(kAutoBalanceMin, (float)(neutral[1] / neutral[0])));
+		balance[2] = fminf(kAutoBalanceMax, fmaxf(kAutoBalanceMin, (float)(neutral[1] / neutral[2])));
+	} else {
+		[_colorLock lock];
+		float gain_g = fmaxf(_colorGains[1], 0.01f);
+		balance[0] = _colorGains[0] / gain_g;
+		balance[2] = _colorGains[2] / gain_g;
+		[_colorLock unlock];
+	}
+
+	// Exposure: bring the 98th-percentile brightness of the background to
+	// the target.
+	uint64_t counted = 0, seen = 0;
+	for (int v = 0; v < 256; v++)
+		counted += hist[v];
+	if (counted < (uint64_t)(kAutoBackgroundMinShare * (float)total)) {
+		memcpy(hist, hist_all, sizeof(hist));
+		counted = 0;
+		for (int v = 0; v < 256; v++)
+			counted += hist[v];
+	}
+	int highlight = 255;
+	for (int v = 0; v < 256 && counted; v++) {
+		seen += hist[v];
+		if (seen * 100 >= counted * 98) {
+			highlight = v;
+			break;
+		}
+	}
+	float highlight_linear = fmaxf(srgb_to_linear(highlight), 0.01f);
+	float gain = fminf(kAutoGainMax, fmaxf(kAutoGainMin, kAutoHighlightTarget / highlight_linear));
+
+	_colorTarget[0] = gain * balance[0];
+	_colorTarget[1] = gain * balance[1];
+	_colorTarget[2] = gain * balance[2];
+	_colorTarget[3] = kAutoColorLift;
+}
+
+- (void)getColorState:(float *)state
+{
+	[_colorLock lock];
+	state[0] = _colorGains[0];
+	state[1] = _colorGains[1];
+	state[2] = _colorGains[2];
+	state[3] = _colorLift;
+	[_colorLock unlock];
+}
+
+- (void)setColorState:(const float *)state
+{
+	[_colorLock lock];
+	_colorGains[0] = state[0];
+	_colorGains[1] = state[1];
+	_colorGains[2] = state[2];
+	_colorLift = state[3];
+	// The publish queue is still idle, so its targets can be set here too.
+	for (int c = 0; c < 4; c++)
+		_colorTarget[c] = state[c];
+	[_colorLock unlock];
+}
+
+// Logs color statistics of the camera frame that the snapshot came from, for
+// tuning color correction without saving the picture: the mean color of
+// skin, of bright plain background and of dark plain clothing, and the spread
+// of brightness. Runs on the publish queue.
+- (void)logColorStatsOf:(CVPixelBufferRef)bgra
+{
+	uint32_t width = (uint32_t)CVPixelBufferGetWidth(bgra);
+	uint32_t height = (uint32_t)CVPixelBufferGetHeight(bgra);
+	if (!_smoothed || width != _smoothWidth || height != _smoothHeight)
+		return;
+
+	double skin[3] = {0}, wall[3] = {0}, dark[3] = {0};
+	uint64_t skin_n = 0, wall_n = 0, dark_n = 0, total = 0;
+	uint64_t hist[256] = {0};
+	CVPixelBufferLockBaseAddress(bgra, kCVPixelBufferLock_ReadOnly);
+	const uint8_t *base = CVPixelBufferGetBaseAddress(bgra);
+	size_t stride = CVPixelBufferGetBytesPerRow(bgra);
+	for (uint32_t y = 0; y < height; y += 2) {
+		for (uint32_t x = 0; x < width; x += 2) {
+			const uint8_t *p = base + y * stride + (size_t)x * 4;
+			int b = p[0], g = p[1], r = p[2];
+			int luma = (54 * r + 183 * g + 19 * b) >> 8;
+			int spread = MAX(r, MAX(g, b)) - MIN(r, MIN(g, b));
+			float m = _smoothed[(size_t)y * width + x];
+			hist[luma]++;
+			total++;
+			if (m >= 250.0f) {
+				float warmth = r > 0 ? (float)(r - g) / (float)r : 0.0f;
+				if (r > g && g > b && r > 60 && warmth > 0.12f && warmth < 0.45f) {
+					skin[0] += r, skin[1] += g, skin[2] += b;
+					skin_n++;
+				} else if (luma < 110 && spread < 20) {
+					dark[0] += r, dark[1] += g, dark[2] += b;
+					dark_n++;
+				}
+			} else if (m <= 5.0f && luma > 140 && spread < 30) {
+				wall[0] += r, wall[1] += g, wall[2] += b;
+				wall_n++;
+			}
+		}
+	}
+	CVPixelBufferUnlockBaseAddress(bgra, kCVPixelBufferLock_ReadOnly);
+
+	int pct[3] = {0}, wanted[3] = {1, 50, 99}, k = 0;
+	uint64_t seen = 0;
+	for (int v = 0; v < 256 && k < 3; v++) {
+		seen += hist[v];
+		while (k < 3 && seen * 100 >= total * (uint64_t)wanted[k])
+			pct[k++] = v;
+	}
+#define MEAN(a, n, i) ((n) ? (a)[i] / (double)(n) : 0.0)
+	blog_rvm(LOG_INFO,
+		 "Camera color: skin %.0f %.0f %.0f, bright background %.0f %.0f %.0f, dark clothing %.0f %.0f %.0f "
+		 "(R G B), brightness p1 %d p50 %d p99 %d",
+		 MEAN(skin, skin_n, 0), MEAN(skin, skin_n, 1), MEAN(skin, skin_n, 2), MEAN(wall, wall_n, 0),
+		 MEAN(wall, wall_n, 1), MEAN(wall, wall_n, 2), MEAN(dark, dark_n, 0), MEAN(dark, dark_n, 1),
+		 MEAN(dark, dark_n, 2), pct[0], pct[1], pct[2]);
+#undef MEAN
 }
 
 - (BOOL)copyMatteFor:(uint64_t)timestamp
@@ -1155,7 +1410,7 @@ static void write_gray_png(const uint8_t *data, uint32_t width, uint32_t height,
 		NSString *base = [path stringByDeletingPathExtension];
 		write_gray_png(_chairCut, (uint32_t)_modelWidth, (uint32_t)_modelHeight,
 			       [base stringByAppendingString:@"-chair.png"]);
-		// The chair score of every grid cell, for tuning the colour test.
+		// The chair score of every grid cell, for tuning the color test.
 		// It holds no picture detail beyond redness.
 		size_t grid_count = (size_t)_gridWidth * _gridHeight;
 		uint8_t *score = malloc(grid_count);
@@ -1184,6 +1439,12 @@ static void write_gray_png(const uint8_t *data, uint32_t width, uint32_t height,
 			 (unsigned long long)_statsSkipped, _statsRawChange / (double)_statsCount,
 			 _statsChange / (double)_statsCount, _statsEdge.raw / (double)MAX(_statsEdge.pixels, 1),
 			 _statsEdge.shown / (double)MAX(_statsEdge.pixels, 1));
+		if (self.autoColor) {
+			float gains[4];
+			[self getColorState:gains];
+			blog_rvm(LOG_INFO, "Automatic color gains: red %.2f, green %.2f, blue %.2f", gains[0],
+				 gains[1], gains[2]);
+		}
 		_statsStart = now;
 		_statsRawChange = 0;
 		_statsChange = 0;
@@ -1197,7 +1458,7 @@ static void write_gray_png(const uint8_t *data, uint32_t width, uint32_t height,
 
 - (void)drain
 {
-	self.cancelled = YES;
+	self.canceled = YES;
 	dispatch_sync(_queue, ^{
 	});
 	dispatch_sync(_postQueue, ^{
@@ -1238,6 +1499,8 @@ struct rvm_filter {
 	gs_eparam_t *param_matte;
 	gs_eparam_t *param_low;
 	gs_eparam_t *param_high;
+	gs_eparam_t *param_gain;
+	gs_eparam_t *param_lift;
 
 	void *engine; // RVMEngine, retained via CFBridgingRetain
 	void *loader; // RVMEngineLoader, retained via CFBridgingRetain
@@ -1272,6 +1535,7 @@ struct rvm_filter {
 	volatile bool plate_forget_requested;
 	bool use_plate;
 	bool remove_chair;
+	bool auto_color;
 };
 
 static void release_held_frames(struct rvm_filter *f, obs_source_t *parent)
@@ -1318,6 +1582,7 @@ static void apply_engine_settings(struct rvm_filter *f)
 	engine.stability = f->stability;
 	engine.usePlate = f->use_plate;
 	engine.removeChair = f->remove_chair;
+	engine.autoColor = f->auto_color;
 	// A snapshot waits for a model that is loading, so a switch does not
 	// retire the engine before it writes the snapshot.
 	if (f->snapshot_name && !f->loading) {
@@ -1345,6 +1610,11 @@ static void adopt_ready_engine(struct rvm_filter *f)
 		return;
 	if (loader.request == ready.request)
 		f->loading = false;
+	if (f->engine) {
+		float state[4];
+		[engine_of(f) getColorState:state];
+		[ready setColorState:state];
+	}
 	retire_engine(f, false);
 	f->engine = (void *)CFBridgingRetain(ready);
 	f->matte_generation = 0;
@@ -1415,6 +1685,7 @@ static void rvm_update(void *data, obs_data_t *settings)
 	f->sync = obs_data_get_bool(settings, "sync_video");
 	f->use_plate = obs_data_get_bool(settings, "use_plate");
 	f->remove_chair = obs_data_get_bool(settings, "remove_chair");
+	f->auto_color = obs_data_get_bool(settings, "auto_color");
 
 	// Only the bundled models and the listed compute units can be used, so a
 	// scene collection cannot point the filter at another file.
@@ -1467,6 +1738,8 @@ static void *rvm_create(obs_data_t *settings, obs_source_t *context)
 		f->param_matte = gs_effect_get_param_by_name(f->effect, "matte");
 		f->param_low = gs_effect_get_param_by_name(f->effect, "alpha_low");
 		f->param_high = gs_effect_get_param_by_name(f->effect, "alpha_high");
+		f->param_gain = gs_effect_get_param_by_name(f->effect, "color_gain");
+		f->param_lift = gs_effect_get_param_by_name(f->effect, "color_lift");
 	}
 	obs_leave_graphics();
 	bfree(effect_path);
@@ -1603,7 +1876,7 @@ static void rvm_video_render(void *data, gs_effect_t *unused)
 		return;
 	}
 
-	// Same colour-space handling and premultiplied blending as OBS's own
+	// Same color-space handling and premultiplied blending as OBS's own
 	// chroma key filter, so this filter can sit anywhere in a filter chain.
 	const enum gs_color_space preferred_spaces[] = {
 		GS_CS_SRGB,
@@ -1619,6 +1892,15 @@ static void rvm_video_render(void *data, gs_effect_t *unused)
 	gs_effect_set_texture(f->param_matte, f->matte_tex);
 	gs_effect_set_float(f->param_low, f->alpha_low);
 	gs_effect_set_float(f->param_high, f->alpha_high);
+	// The shader's color math assumes sRGB-encoded 8-bit input, so wide-gamut
+	// and HDR sources are left unchanged.
+	float state[4] = {1.0f, 1.0f, 1.0f, 1.0f};
+	if (space == GS_CS_SRGB)
+		[engine_of(f) getColorState:state];
+	struct vec3 gain;
+	vec3_set(&gain, state[0], state[1], state[2]);
+	gs_effect_set_vec3(f->param_gain, &gain);
+	gs_effect_set_float(f->param_lift, state[3]);
 
 	gs_blend_state_push();
 	gs_blend_function(GS_BLEND_ONE, GS_BLEND_INVSRCALPHA);
@@ -1636,6 +1918,7 @@ static void rvm_defaults(obs_data_t *settings)
 	obs_data_set_default_bool(settings, "sync_video", true);
 	obs_data_set_default_bool(settings, "use_plate", true);
 	obs_data_set_default_bool(settings, "remove_chair", false);
+	obs_data_set_default_bool(settings, "auto_color", false);
 }
 
 static bool rvm_capture_plate_clicked(obs_properties_t *props, obs_property_t *property, void *data)
@@ -1679,6 +1962,9 @@ static obs_properties_t *rvm_properties(void *data)
 	obs_property_set_long_description(stability, obs_module_text("EdgeStability.Description"));
 	obs_property_t *sync = obs_properties_add_bool(props, "sync_video", obs_module_text("SyncVideo"));
 	obs_property_set_long_description(sync, obs_module_text("SyncVideo.Description"));
+
+	obs_property_t *auto_color = obs_properties_add_bool(props, "auto_color", obs_module_text("AutoColor"));
+	obs_property_set_long_description(auto_color, obs_module_text("AutoColor.Description"));
 
 	obs_property_t *remove_chair = obs_properties_add_bool(props, "remove_chair", obs_module_text("RemoveChair"));
 	obs_property_set_long_description(remove_chair, obs_module_text("RemoveChair.Description"));

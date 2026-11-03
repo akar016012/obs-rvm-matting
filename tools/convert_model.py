@@ -5,7 +5,7 @@
 
 The Core ML files published with RVM use the older NeuralNetwork format and
 run at about 60 ms per 1080p frame on Apple silicon. This script re-exports
-the weights as an ML Program in float16, and drops the foreground-colour
+the weights as an ML Program in float16, and drops the foreground-color
 output, so only the alpha matte is computed at full resolution. Benchmarked
 on their own, the MobileNetV3 model then takes about 11 ms per frame on the
 GPU and the ResNet-50 model about 23 to 30 ms; inside OBS, which shares the

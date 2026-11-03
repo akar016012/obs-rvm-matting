@@ -39,8 +39,8 @@ Open an issue with the feature request form and describe the problem you want so
 
 - `filter_video`, `update` and `video_render` all run on the OBS video thread. Anything slower than a memory copy belongs on the engine's background queues.
 - Frames held by **Line up cutout with video** must always be released with `obs_source_release_frame`, or the camera source runs out of frames.
-- The RVM models are GPL-3.0. Do not add code or models under a licence that is incompatible with GPL-3.0.
+- The RVM models are GPL-3.0. Do not add code or models under a license that is incompatible with GPL-3.0.
 
-## Licence of contributions
+## License of contributions
 
-By contributing, you agree that your contributions are licensed under the GNU General Public License version 3 or later, the same licence as the rest of the project.
+By contributing, you agree that your contributions are licensed under the GNU General Public License version 3 or later, the same license as the rest of the project.

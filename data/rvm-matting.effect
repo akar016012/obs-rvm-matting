@@ -3,7 +3,7 @@
 //
 // Multiplies the source by the RVM alpha matte. The source arrives
 // premultiplied, so scaling all four channels keeps it premultiplied. The
-// matte texture's second channel marks where to remove the chair's colour
+// matte texture's second channel marks where to remove the chair's color
 // spill.
 
 uniform float4x4 ViewProj;
@@ -13,6 +13,10 @@ uniform texture2d matte;
 // alpha_high fully opaque; values in between are eased with smoothstep.
 uniform float alpha_low;
 uniform float alpha_high;
+// Automatic color: per-channel gains in linear light, then a mid-tone lift
+// (a power below 1). Gains of 1 and a lift of 1 leave the color unchanged.
+uniform float3 color_gain;
+uniform float color_lift;
 
 sampler_state textureSampler {
 	Filter    = Linear;
@@ -33,6 +37,23 @@ VertData VSDefault(VertData v_in)
 	return vert_out;
 }
 
+float srgb_to_linear(float c)
+{
+	return (c <= 0.04045) ? (c / 12.92) : pow((c + 0.055) / 1.055, 2.4);
+}
+
+float linear_to_srgb(float c)
+{
+	return (c <= 0.0031308) ? (c * 12.92) : (1.055 * pow(c, 1.0 / 2.4) - 0.055);
+}
+
+float3 apply_color(float3 rgb)
+{
+	float3 lin = float3(srgb_to_linear(rgb.r), srgb_to_linear(rgb.g), srgb_to_linear(rgb.b));
+	lin = pow(saturate(lin * color_gain), float3(color_lift, color_lift, color_lift));
+	return float3(linear_to_srgb(lin.r), linear_to_srgb(lin.g), linear_to_srgb(lin.b));
+}
+
 float4 PSMatte(VertData v_in) : TARGET
 {
 	float4 rgba = image.Sample(textureSampler, v_in.uv);
@@ -46,6 +67,14 @@ float4 PSMatte(VertData v_in) : TARGET
 	float magenta = saturate((rgba.b - rgba.g) * 8.0);
 	float neutral_red = min(rgba.r, max(rgba.g, rgba.b));
 	rgba.r = lerp(rgba.r, neutral_red, m.g * magenta);
+
+	// The camera image is opaque here, but undo any premultiplication so the
+	// color math sees true colors.
+	float3 gain_change = abs(color_gain - float3(1.0, 1.0, 1.0));
+	if (color_lift != 1.0 || gain_change.r + gain_change.g + gain_change.b > 0.0) {
+		float inv = rgba.a > 0.0 ? 1.0 / rgba.a : 0.0;
+		rgba.rgb = apply_color(rgba.rgb * inv) * rgba.a;
+	}
 
 	return rgba * a;
 }

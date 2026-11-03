@@ -10,7 +10,8 @@ The filter shows up in OBS as **Person Matting (RVM)**.
 - Each camera frame can wait for its own cutout, so a waving hand or a raised mug is cut where it is, not where it was a frame earlier. This costs about one frame of delay.
 - The edge is held steady where the picture is still, and camera noise along dark edges such as headphone foam is smoothed out, so the outline does not dance.
 - An optional photo of the empty room removes anything the model mistakes for you, such as a lamp or a door.
-- An optional colour rule always removes a red or magenta chair behind you, such as a mesh headrest.
+- An optional color rule always removes a red or magenta chair behind you, such as a mesh headrest.
+- Optional automatic color corrects brightness and white balance as the light changes, without changing your skin tone.
 
 ## Requirements
 
@@ -68,17 +69,23 @@ rm -rf ~/Library/Application\ Support/obs-studio/plugin_config/obs-rvm-matting
 - **Hide faint edges below** and **Make solid above** set how the soft edge is drawn. Matte values below the first become transparent and values above the second become solid. The defaults of 0.25 and 0.75 give a crisper edge than the model's raw output.
 - **Steady edges** holds the cutout still where the camera picture has not changed between frames, so the edge stops flickering. Where the picture moves, the cutout follows at once. Set it to 0 to turn the steadying off. The light blur that removes camera noise from the edge always applies.
 - **Line up cutout with video** holds each camera frame until its own cutout is ready, so fast-moving hands and objects are cut where they are. It delays the video by about one frame (33 ms at 30 fps). If four frames are already waiting, the oldest is shown anyway with the newest earlier cutout. If no cutout has arrived for half a second, for example while the first model is still loading when OBS starts, frames are shown without waiting, so the video never freezes. Until the first cutout arrives they are shown uncut; after that, the newest available cutout is used.
-- **Remove my red chair** always cuts out red or magenta pixels outside the solid middle of your body, such as a red mesh headrest that the model sometimes counts as part of you. It tells the chair apart from skin and wood by its magenta tint: the mesh has more blue than green, while skin and wood have more green than blue. It is off by default, because it only suits chairs of that colour. Three details keep the edge clean:
+- **Automatic color** corrects brightness and white balance by itself, for any camera, and follows the light through the day. It is off by default. Turn off any **Color Correction** filter on the same camera while it is on, or the two corrections add up.
+  - Brightness is set from the room, not from you: the brightest 2% of the background are brought to a fixed level, and mid-tones get a gentle lift like a phone camera's. If you fill almost the whole picture, the whole picture is used instead.
+  - White balance makes plain background areas, such as walls, neutral. If there are almost none in view, the last white balance is kept.
+  - Skin never sets the white balance, and sets the brightness only in a close-up with almost no background in view, so every skin tone keeps its own color.
+  - Changes are made gradually over a few seconds, both when the light changes and when you turn the setting on or off, so the picture never visibly pumps. The current red, green and blue gains, which include both exposure and white balance, are written to the OBS log every 30 seconds.
+  - It only adjusts standard (SDR) camera video. HDR and wide-gamut sources are left unchanged.
+- **Remove my red chair** always cuts out red or magenta pixels outside the solid middle of your body, such as a red mesh headrest that the model sometimes counts as part of you. It tells the chair apart from skin and wood by its magenta tint: the mesh has more blue than green, while skin and wood have more green than blue. It is off by default, because it only suits chairs of that color. Three details keep the edge clean:
   - Where the model counts a pixel as mostly you, the pixel is only cut if it looks like chair itself, so a black earcup in front of the chair keeps its edge.
   - Close to where the chair was cut, strips of the cutout thinner than about 9 pixels are removed, which takes away the chair's black rim.
-  - Close to the cut, any remaining pixel with the chair's magenta tint has its red pulled down to its other colours, so a leftover rim looks like neutral shadow instead of a red fringe.
+  - Close to the cut, any remaining pixel with the chair's magenta tint has its red pulled down to its other colors, so a leftover rim looks like neutral shadow instead of a red fringe.
 - **Use empty-background photo** cuts out anything that matches a photo of your empty room. Click **Capture empty background (in 5 seconds)** and step out of view, and the photo is taken five seconds later. It is saved as `background-photo.png` in the plugin's OBS config folder and reloaded on start. The photo slowly follows lighting changes where the model is sure it sees background. **Forget background photo** deletes it. The setting does nothing until a photo has been taken.
 
 The solid middle of your body, which is the fully opaque part of the cutout shrunk inwards by about 16 pixels, is never cut by the chair rule or by the background photo. Clothes that happen to match what is behind them therefore keep no holes.
 
 ## Models
 
-The Core ML files published with RVM use Core ML's older NeuralNetwork format and took about 60 ms per 1080p frame inside OBS. `tools/convert_model.py` re-exports the PyTorch weights as a float16 ML Program and computes only the alpha matte, not the foreground colour, which makes them several times faster. `build.sh` downloads the RVM v1.0.0 weights and runs the conversion for you.
+The Core ML files published with RVM use Core ML's older NeuralNetwork format and took about 60 ms per 1080p frame inside OBS. `tools/convert_model.py` re-exports the PyTorch weights as a float16 ML Program and computes only the alpha matte, not the foreground color, which makes them several times faster. `build.sh` downloads the RVM v1.0.0 weights and runs the conversion for you.
 
 | Model setting           | Network     | Time per frame inside OBS              | Notes                                                                   |
 | ----------------------- | ----------- | -------------------------------------- | ----------------------------------------------------------------------- |
@@ -92,7 +99,7 @@ Both models take 1920x1080 frames, run the network on a quarter-size copy, and u
 - **The filter is missing from the list.** Check the OBS log (**Help → Log Files → Show Log Files**) for lines starting with `[rvm-matting]`. A missing line means OBS did not load the plugin; make sure it is in `~/Library/Application Support/obs-studio/plugins/` and that you restarted OBS after installing.
 - **The cutout lags or stutters.** The log prints a line like the one below every 30 seconds. If `inference avg` is above 33 ms, switch **Model** to **Standard**, or try the other **Run on** choice.
 - **Something behind you keeps appearing.** Take an empty-background photo, or turn on **Remove my red chair** if it is a red chair.
-- **Parts of you disappear when you hold still against a similar-coloured wall.** Click **Forget background photo**, or turn off **Use empty-background photo**.
+- **Parts of you disappear when you hold still against a similar-colored wall.** Click **Forget background photo**, or turn off **Use empty-background photo**.
 
 ```
 [rvm-matting] Matte updates: 26.8 per second, inference avg 27.9 ms, max 41.4 ms, frames skipped 96, flicker 0.433 raw / 0.302 shown, still-edge flicker 6.89 raw / 2.08 shown
@@ -106,11 +113,19 @@ The flicker figures are the mean change between consecutive cutouts, out of 255.
 2. The model queue converts the frame to BGRA at the model size, runs the model with its four recurrent states, and feeds the new states back in for the next frame. The states are reset after more than a second without frames.
 3. A second queue finishes each matte while the model starts on the next frame. It measures where the picture moved since the last frame on a quarter-size grid, applies the background photo and the chair rule, blurs the matte over 5 pixels to remove camera noise, steadies it where the picture is still, and stores it with the timestamp of the frame it came from. The last four mattes are kept.
 4. With **Line up cutout with video** on, `filter_video` holds incoming frames and releases the newest one that has a matte, in the same way as OBS's own Video Delay (Async) filter.
-5. `video_render` uploads the matte for the frame being shown as a two-channel texture, whose second channel marks where to remove the chair's colour. `data/rvm-matting.effect` removes that colour and multiplies the premultiplied camera image by the matte, using the same colour-space handling and blending as OBS's chroma key filter.
+5. `video_render` uploads the matte for the frame being shown as a two-channel texture, whose second channel marks where to remove the chair's color. `data/rvm-matting.effect` removes that color, applies the automatic color gains in linear light when that setting is on, and multiplies the premultiplied camera image by the matte, using the same color-space handling and blending as OBS's chroma key filter.
 
 ### Checking edge quality
 
 The filter has one hidden setting, `debug_snapshot`, which is not shown in the properties dialog. Set it to a plain file name ending in `.png`, such as `matte.png`, in the scene collection JSON while OBS is closed. Other names, and the name of the saved background photo, are ignored. Ninety mattes after the model starts, the filter writes the matte as a grayscale PNG with that name into `~/Library/Application Support/obs-studio/plugin_config/obs-rvm-matting/`, and then clears the setting. Because only plain file names are accepted, the snapshot is never written anywhere else. When the chair rule is on, it also writes `-chair.png` (what was cut) and `-chairscore.png` (how chair-like each grid cell looked) next to it. None of these images contains the camera picture itself.
+
+At the same moment, the filter writes a line like this to the OBS log, which describes the raw camera color before any other filter runs:
+
+```
+[rvm-matting] Camera color: skin 137 88 67, bright background 153 154 162, dark clothing 20 21 22 (R G B), brightness p1 8 p50 140 p99 173
+```
+
+If you prefer fixed settings to **Automatic color**, compare it with the same areas in a reference picture you like, such as one from another camera app, to choose settings for OBS's **Color Correction** filter. That filter works in linear light: **Gamma** lifts the mid-tones, **Contrast** acts as an overall gain, and **Color Multiply** sets the white balance.
 
 ## Project layout
 
@@ -125,7 +140,7 @@ The filter has one hidden setting, `debug_snapshot`, which is not shown in the p
 
 Bug reports, ideas and pull requests are welcome. Please read [CONTRIBUTING.md](CONTRIBUTING.md) before you start, and follow the [code of conduct](CODE_OF_CONDUCT.md). To report a security problem, follow [SECURITY.md](SECURITY.md) instead of opening a public issue.
 
-## Licence
+## License
 
 This project is licensed under the GNU General Public License version 3 or later; see [LICENSE](LICENSE). The RVM models and weights are released under GPL-3.0 by their authors, and OBS Studio is GPL-2.0-or-later, so the plugin and the converted models it bundles are distributed under GPL-3.0.
 
