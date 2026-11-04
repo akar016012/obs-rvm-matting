@@ -10,6 +10,8 @@ All notable changes to this project are recorded in this file. The format follow
 - A debug snapshot now also logs the camera's raw color (skin, bright background, dark clothing and brightness spread), for tuning OBS's color correction without saving the picture.
 - `build.sh` builds the High accuracy model from other ResNet-50 weights when `RVM_RESNET50_WEIGHTS` is set.
 - The cutout holds up better in dim rooms, because dim frames are brightened for the model only. The picture viewers see does not change.
+- **Blend into the room** lights you to suit a chosen **Room background**, so you look like you are in that place.
+- **Clean edge colors** removes the thin line of room color around the cutout. It is on by default and needs no background photo.
 - Every setting now has a **?** help tooltip.
 - **Use empty-background photo** now averages several frames, follows exposure changes, needs a much closer color match so it no longer cuts into necks and shoulders, and can open thin gaps such as the space beside a headband. Its capture button now counts down with sounds, and each filter now keeps its own photo. A photo saved by an earlier version goes to the first filter that loads, so other filters need a new one.
 
@@ -20,6 +22,9 @@ All notable changes to this project are recorded in this file. The format follow
 ### Fixed
 
 - A speckled cutout no longer opens gaps in the protected middle of the body.
+- OBS no longer crashes when you remove a filter that failed to start.
+- **Steady edges** no longer holds a closed gap on screen as a square patch, because large changes now show at once.
+- **Use empty-background photo** no longer cuts through dark headphones that pass in front of a dark chair.
 
 ## 1.0.0 - 2026-11-03
 

@@ -8,10 +8,11 @@
 // copies the frame into a CVPixelBuffer and hands it to a background queue.
 // The queue runs the model, steadies the matte where the picture is still,
 // and keeps the last few mattes tagged with their frame's timestamp.
-// video_render multiplies the source's alpha by a matte on the GPU.
+// video_render cleans the edge colors, lights the person to suit the chosen
+// room background, and multiplies the source's alpha by a matte on the GPU.
 //
 // With "line up cutout with video" on, filter_video holds each frame until
-// its own matte is ready, so the video is delayed by about one frame and
+// its own matte is ready, so the video is delayed by one or two frames and
 // moving hands stay inside the cutout. With it off, frames pass straight
 // through and the newest matte trails them by one inference.
 
@@ -27,7 +28,9 @@
 #include <obs-module.h>
 #include <util/platform.h>
 #include <util/threading.h>
+#include <graphics/vec2.h>
 #include <graphics/vec3.h>
+#include <graphics/vec4.h>
 
 OBS_DECLARE_MODULE()
 OBS_MODULE_USE_DEFAULT_LOCALE("obs-rvm-matting", "en-US")
@@ -55,6 +58,16 @@ static const float kMotionNoiseFloor = 3.0f;
 // Keep it small: if movement is only partly passed through, the parts of an
 // edge that move catch up at different speeds and the outline turns wavy.
 static const float kMotionThreshold = 12.0f;
+// The model wavers by a few levels. A change that averages kSteadyFollowHigh
+// levels or more over three by three grid cells is a real change, so it shows at
+// once even where the picture looks still. Dark hair moving over dark headphones
+// barely changes the picture, and without this a gap that has closed stays
+// visible as a square patch of grid cells. Changes between the two levels are
+// eased in. The average matters: a crisp edge that wobbles by one pixel changes
+// single pixels by up to 85 levels, but its average stays near 21, so it is
+// still steadied.
+static const float kSteadyFollowLow = 32.0f;
+static const float kSteadyFollowHigh = 64.0f;
 // The model's edge carries the camera's sensor noise, which is strongest in
 // dark areas such as headphone foam. The matte is blurred over this many
 // pixels (odd, tent-shaped) to average it out before steadying.
@@ -104,6 +117,10 @@ static const float kPlateGainRate = 0.1f;
 // across) of the person's edge, and is in the upper half of the person. Those
 // last two keep the gap rule on the head and away from patterned clothes.
 static const float kPlateGapMatch = 6.0f;
+// A gap must look brighter than this in the photo, in levels of its largest
+// color channel. Dark headphones cannot be told from a dark chair behind them,
+// so only bright parts of the room can open a gap.
+static const uint8_t kPlateGapMinLevel = 96;
 static const vImagePixelCount kPlateGapWidth = 41;
 static const vImagePixelCount kPlateGapSpeck = 3;
 static const vImagePixelCount kPlateGapReach = 33;
@@ -126,6 +143,29 @@ static const int kPlateAdaptEvery = 8;
 static const int kPlateAdaptLimit = 24;
 // The photo is taken this long after the capture button is clicked.
 static const double kPlateCaptureDelaySeconds = 5.0;
+
+// "Blend into the room": the room background is rendered small and halved again
+// and again, which blurs it for free. The shader takes edge light from
+// kRoomWrapMap, the room's light direction from kRoomLightMap and its overall
+// color from kRoomMeanMap, the last one, which is a single pixel.
+static const struct {
+	uint32_t width;
+	uint32_t height;
+} kRoomMaps[] = {{512, 288}, {256, 144}, {128, 72}, {64, 36}, {32, 18}, {16, 9}, {8, 4}, {4, 2}, {2, 1}, {1, 1}};
+#define ROOM_MAP_COUNT (sizeof(kRoomMaps) / sizeof(kRoomMaps[0]))
+static const size_t kRoomWrapMap = 3;
+static const size_t kRoomLightMap = 6;
+static const size_t kRoomMeanMap = ROOM_MAP_COUNT - 1;
+// This is how far around a pixel the shader looks for the edge of the person,
+// as a share of the picture height (13.5 pixels at 1080p).
+static const float kRoomEdgeReach = 1.0f / 80.0f;
+// A room source that is missing, usually because it has not loaded yet, is
+// looked up again after this long.
+static const uint64_t kRoomLookupNs = 1000000000ULL;
+
+// This is how far inside the person "Clean edge colors" looks for a clean color,
+// as a share of the picture height (4.5 pixels at 1080p).
+static const float kEdgeReach = 1.0f / 240.0f;
 // Automatic color: every kAutoColorEvery mattes the frame is measured to set
 // new targets, and on every matte the color moves kAutoColorRate of the way
 // toward them. Small steps on every frame settle over a few seconds without
@@ -265,6 +305,7 @@ struct edge_flicker {
 	uint8_t *_previous;
 	uint8_t *_edgeBlurred;
 	float *_smoothed;
+	float *_changeGrid;
 	uint32_t _smoothWidth;
 	uint32_t _smoothHeight;
 	BOOL _smoothValid;
@@ -422,6 +463,7 @@ struct edge_flicker {
 	free(_incoming);
 	free(_previous);
 	free(_edgeBlurred);
+	free(_changeGrid);
 	free(_smoothed);
 	free(_gridBGRA);
 	free(_luma);
@@ -588,6 +630,8 @@ static void copy_plane(uint8_t *dst, size_t dst_stride, const uint8_t *src, size
 		_prevLuma = malloc(count);
 		_diff = malloc(count);
 		_motion = malloc(count);
+		free(_changeGrid);
+		_changeGrid = malloc(count * 2 * sizeof(float));
 		_gridWidth = gw;
 		_gridHeight = gh;
 		_motionValid = NO;
@@ -939,8 +983,10 @@ static CGContextRef create_bgra_context(void *data, size_t width, size_t height)
 	// Find thin gaps: exact matches, minus wide areas and single specks.
 	size_t count = (size_t)width * height;
 	for (size_t i = 0; i < count; i++) {
+		const uint8_t *q = _plate + i * 4;
 		float limit = kPlateGapMatch + kPlateNoiseScale * (float)_plateNoise[i];
-		_plateGap[i] = matte[i] && (float)_plateDiffBlur[i] <= limit ? 255 : 0;
+		BOOL bright = MAX(q[0], MAX(q[1], q[2])) >= kPlateGapMinLevel;
+		_plateGap[i] = bright && matte[i] && (float)_plateDiffBlur[i] <= limit ? 255 : 0;
 	}
 	vImage_Buffer gap = {.data = _plateGap, .height = height, .width = width, .rowBytes = width};
 	vImage_Buffer wide = {.data = _plateGapWide, .height = height, .width = width, .rowBytes = width};
@@ -1152,30 +1198,65 @@ static CGContextRef create_bgra_context(void *data, size_t width, size_t height)
 	});
 }
 
-// Damps changes in the matte where the camera picture is still. Each pixel
-// moves toward the new value by a weight that is small where nothing moved
-// (so the model's wavering settles) and 1 where the picture moved (so the
-// cutout follows at once). raw and previous are the unblurred mattes of this
+// Damps small changes in the matte where the camera picture is still. Each
+// pixel moves toward the new value by a weight that is small where nothing moved
+// (so the model's wavering settles) and 1 where the picture moved or the change
+// is large over a block (so the cutout follows at once). change_grid holds two
+// grids of floats, used as scratch space. raw and previous are the unblurred mattes of this
 // frame and the last, used only for the edge flicker statistic. Returns the
 // summed absolute change, for the overall flicker statistic.
 static double smooth_matte(float *smoothed, const uint8_t *incoming, const uint8_t *raw, const uint8_t *previous,
 			   uint32_t width, uint32_t height, const uint8_t *motion, uint32_t grid_width,
-			   uint32_t grid_height, float stability, struct edge_flicker *edge)
+			   uint32_t grid_height, float stability, float *change_grid, struct edge_flicker *edge)
 {
 	const float still_weight = 1.0f - 0.95f * stability;
 	const float inv_threshold = 1.0f / kMotionThreshold;
+	const float inv_follow = 1.0f / (kSteadyFollowHigh - kSteadyFollowLow);
 	double change = 0.0;
+
+	// This sums the change in each grid cell, and then averages each block of
+	// three by three cells. Blocks at the picture's edge have fewer cells.
+	size_t grid_count = (size_t)grid_width * grid_height;
+	float *cells = change_grid;
+	float *blocks = change_grid + grid_count;
+	memset(cells, 0, grid_count * sizeof(float));
 	for (uint32_t y = 0; y < height; y++) {
-		const uint8_t *motion_row = motion + (size_t)MIN(y / kMotionGridScale, grid_height - 1) * grid_width;
+		float *cell_row = cells + (size_t)MIN(y / kMotionGridScale, grid_height - 1) * grid_width;
+		const float *s = smoothed + (size_t)y * width;
+		const uint8_t *in = incoming + (size_t)y * width;
+		for (uint32_t x = 0; x < width; x++)
+			cell_row[MIN(x / kMotionGridScale, grid_width - 1)] += fabsf((float)in[x] - s[x]);
+	}
+	const float inv_cell = 1.0f / (float)(kMotionGridScale * kMotionGridScale);
+	for (uint32_t y = 0; y < grid_height; y++) {
+		for (uint32_t x = 0; x < grid_width; x++) {
+			float sum = 0.0f;
+			float visited = 0.0f;
+			for (uint32_t cy = y ? y - 1 : 0; cy <= MIN(y + 1, grid_height - 1); cy++) {
+				for (uint32_t cx = x ? x - 1 : 0; cx <= MIN(x + 1, grid_width - 1); cx++) {
+					sum += cells[(size_t)cy * grid_width + cx];
+					visited += 1.0f;
+				}
+			}
+			blocks[(size_t)y * grid_width + x] = sum * inv_cell / visited;
+		}
+	}
+
+	for (uint32_t y = 0; y < height; y++) {
+		size_t grid_row = (size_t)MIN(y / kMotionGridScale, grid_height - 1) * grid_width;
+		const uint8_t *motion_row = motion + grid_row;
+		const float *block_row = blocks + grid_row;
 		float *s = smoothed + (size_t)y * width;
 		const uint8_t *in = incoming + (size_t)y * width;
 		const uint8_t *r = raw + (size_t)y * width;
 		const uint8_t *p = previous + (size_t)y * width;
 		for (uint32_t x = 0; x < width; x++) {
-			float m = (float)motion_row[MIN(x / kMotionGridScale, grid_width - 1)];
+			uint32_t cell = MIN(x / kMotionGridScale, grid_width - 1);
+			float m = (float)motion_row[cell];
 			float moving = fminf(1.0f, fmaxf(0.0f, (m - kMotionNoiseFloor) * inv_threshold));
-			float w = still_weight + (1.0f - still_weight) * moving;
 			float d = (float)in[x] - s[x];
+			float large = fminf(1.0f, fmaxf(0.0f, (block_row[cell] - kSteadyFollowLow) * inv_follow));
+			float w = still_weight + (1.0f - still_weight) * fmaxf(moving, large);
 			s[x] += d * w;
 			change += fabsf(d * w);
 			if (moving == 0.0f && ((r[x] >= 8 && r[x] <= 247) || (p[x] >= 8 && p[x] <= 247))) {
@@ -1256,7 +1337,7 @@ static double smooth_matte(float *smoothed, const uint8_t *incoming, const uint8
 			raw_change += abs((int)_incoming[i] - (int)_previous[i]);
 		_statsRawChange += raw_change / (double)count;
 		_statsChange += smooth_matte(_smoothed, _edgeBlurred, _incoming, _previous, width, height, _motion,
-					     _gridWidth, _gridHeight, self.stability, &_statsEdge) /
+					     _gridWidth, _gridHeight, self.stability, _changeGrid, &_statsEdge) /
 				(double)count;
 	} else {
 		for (size_t i = 0; i < count; i++)
@@ -1675,6 +1756,12 @@ struct rvm_filter {
 	gs_eparam_t *param_high;
 	gs_eparam_t *param_gain;
 	gs_eparam_t *param_lift;
+	gs_eparam_t *param_edge_reach;
+	gs_eparam_t *param_room_wrap;
+	gs_eparam_t *param_room_light;
+	gs_eparam_t *param_room_mean;
+	gs_eparam_t *param_room_blend;
+	gs_eparam_t *param_room_reach;
 
 	void *engine; // RVMEngine, retained via CFBridgingRetain
 	void *loader; // RVMEngineLoader, retained via CFBridgingRetain
@@ -1692,6 +1779,16 @@ struct rvm_filter {
 	float alpha_low;
 	float alpha_high;
 	float stability;
+	bool clean_edges;
+
+	// "Blend into the room". All of this is used on the video thread.
+	char *room_name;
+	obs_weak_source_t *room;
+	float room_blend;
+	gs_texrender_t *room_maps[ROOM_MAP_COUNT];
+	uint64_t room_next_lookup;
+	uint64_t room_frame_time;
+	bool room_ready;
 
 	// "Line up cutout with video": frames wait here until their own matte is
 	// ready. OBS calls filter_video, update and video_render on its video
@@ -1859,6 +1956,17 @@ static void rvm_update(void *data, obs_data_t *settings)
 	if (f->alpha_high <= f->alpha_low + 0.01f)
 		f->alpha_high = f->alpha_low + 0.01f;
 	f->stability = (float)obs_data_get_double(settings, "edge_stability");
+	f->clean_edges = obs_data_get_bool(settings, "clean_edges");
+	f->room_blend = (float)obs_data_get_double(settings, "room_blend");
+	const char *room_name = obs_data_get_string(settings, "room_source");
+	if (strcmp(room_name, f->room_name ? f->room_name : "") != 0) {
+		bfree(f->room_name);
+		f->room_name = bstrdup(room_name);
+		obs_weak_source_release(f->room);
+		f->room = NULL;
+		f->room_next_lookup = 0;
+		f->room_ready = false;
+	}
 	f->sync = obs_data_get_bool(settings, "sync_video");
 	f->use_plate = obs_data_get_bool(settings, "use_plate");
 	f->auto_color = obs_data_get_bool(settings, "auto_color");
@@ -1919,6 +2027,12 @@ static void *rvm_create(obs_data_t *settings, obs_source_t *context)
 		f->param_high = gs_effect_get_param_by_name(f->effect, "alpha_high");
 		f->param_gain = gs_effect_get_param_by_name(f->effect, "color_gain");
 		f->param_lift = gs_effect_get_param_by_name(f->effect, "color_lift");
+		f->param_edge_reach = gs_effect_get_param_by_name(f->effect, "edge_reach");
+		f->param_room_wrap = gs_effect_get_param_by_name(f->effect, "room_wrap");
+		f->param_room_light = gs_effect_get_param_by_name(f->effect, "room_light");
+		f->param_room_mean = gs_effect_get_param_by_name(f->effect, "room_mean");
+		f->param_room_blend = gs_effect_get_param_by_name(f->effect, "room_blend");
+		f->param_room_reach = gs_effect_get_param_by_name(f->effect, "room_reach");
 	}
 	obs_leave_graphics();
 	bfree(effect_path);
@@ -1958,8 +2072,12 @@ static void rvm_destroy(void *data)
 	obs_enter_graphics();
 	gs_effect_destroy(f->effect);
 	gs_texture_destroy(f->matte_tex);
+	for (size_t i = 0; i < ROOM_MAP_COUNT; i++)
+		gs_texrender_destroy(f->room_maps[i]);
 	obs_leave_graphics();
 
+	obs_weak_source_release(f->room);
+	bfree(f->room_name);
 	bfree(f->matte_copy);
 	bfree(f->model_name);
 	bfree(f->snapshot_name);
@@ -1971,7 +2089,9 @@ static void rvm_destroy(void *data)
 // as in OBS's own async delay filter.
 static void rvm_filter_remove(void *data, obs_source_t *parent)
 {
-	release_held_frames(data, parent);
+	// OBS calls this even when rvm_create failed and left no data.
+	if (data)
+		release_held_frames(data, parent);
 }
 
 static struct obs_source_frame *rvm_filter_video(void *data, struct obs_source_frame *frame)
@@ -2038,6 +2158,103 @@ static struct obs_source_frame *rvm_filter_video(void *data, struct obs_source_f
 	return out;
 }
 
+struct room_tree {
+	obs_source_t *camera;
+	bool found;
+};
+
+static void rvm_find_camera(obs_source_t *parent, obs_source_t *child, void *data)
+{
+	UNUSED_PARAMETER(parent);
+	struct room_tree *tree = data;
+	if (child == tree->camera)
+		tree->found = true;
+}
+
+// A room that shows the camera would draw the person into their own light, and
+// nesting a scene item's render inside itself upsets the render target.
+static bool room_contains(obs_source_t *room, obs_source_t *camera)
+{
+	struct room_tree tree = {camera, room == camera};
+	if (camera && !tree.found)
+		obs_source_enum_full_tree(room, rvm_find_camera, &tree);
+	return tree.found;
+}
+
+// Returns the chosen room background with a new reference, or NULL.
+static obs_source_t *room_source(struct rvm_filter *f)
+{
+	obs_source_t *room = f->room ? obs_weak_source_get_source(f->room) : NULL;
+	if (room || !f->room_name || !*f->room_name)
+		return room;
+
+	uint64_t now = os_gettime_ns();
+	if (now < f->room_next_lookup)
+		return NULL;
+	f->room_next_lookup = now + kRoomLookupNs;
+	room = obs_get_source_by_name(f->room_name);
+	if (room && room_contains(room, obs_filter_get_parent(f->context))) {
+		obs_source_release(room);
+		room = NULL;
+	}
+	obs_weak_source_release(f->room);
+	f->room = room ? obs_source_get_weak_source(room) : NULL;
+	return room;
+}
+
+// Renders the room background into the blurred maps, once per video frame.
+// This must run outside obs_source_process_filter_begin and _end.
+static void render_room_maps(struct rvm_filter *f)
+{
+	uint64_t frame_time = obs_get_video_frame_time();
+	if (frame_time == f->room_frame_time)
+		return;
+	f->room_frame_time = frame_time;
+	f->room_ready = false;
+
+	obs_source_t *room = room_source(f);
+	if (!room)
+		return;
+	uint32_t room_width = obs_source_get_width(room);
+	uint32_t room_height = obs_source_get_height(room);
+	if (room == obs_filter_get_parent(f->context) || !room_width || !room_height) {
+		obs_source_release(room);
+		return;
+	}
+
+	gs_effect_t *copy = obs_get_base_effect(OBS_EFFECT_DEFAULT);
+	gs_eparam_t *copy_image = gs_effect_get_param_by_name(copy, "image");
+	bool drawn = true;
+	gs_blend_state_push();
+	gs_blend_function(GS_BLEND_ONE, GS_BLEND_ZERO);
+	for (size_t i = 0; i < ROOM_MAP_COUNT && drawn; i++) {
+		uint32_t width = kRoomMaps[i].width, height = kRoomMaps[i].height;
+		if (!f->room_maps[i])
+			f->room_maps[i] = gs_texrender_create(GS_RGBA, GS_ZS_NONE);
+		gs_texrender_reset(f->room_maps[i]);
+		drawn = gs_texrender_begin(f->room_maps[i], width, height);
+		if (!drawn)
+			break;
+		struct vec4 clear;
+		vec4_zero(&clear);
+		gs_clear(GS_CLEAR_COLOR, &clear, 0.0f, 0);
+		if (i == 0) {
+			gs_ortho(0.0f, (float)room_width, 0.0f, (float)room_height, -100.0f, 100.0f);
+			obs_source_video_render(room);
+		} else {
+			gs_ortho(0.0f, (float)width, 0.0f, (float)height, -100.0f, 100.0f);
+			gs_texture_t *larger = gs_texrender_get_texture(f->room_maps[i - 1]);
+			gs_effect_set_texture(copy_image, larger);
+			while (gs_effect_loop(copy, "Draw"))
+				gs_draw_sprite(larger, 0, width, height);
+		}
+		gs_texrender_end(f->room_maps[i]);
+	}
+	gs_blend_state_pop();
+	obs_source_release(room);
+	f->room_ready = drawn;
+}
+
 static void rvm_video_render(void *data, gs_effect_t *unused)
 {
 	UNUSED_PARAMETER(unused);
@@ -2075,6 +2292,11 @@ static void rvm_video_render(void *data, gs_effect_t *unused)
 	};
 	const enum gs_color_space space = obs_source_get_color_space(obs_filter_get_target(f->context),
 								     OBS_COUNTOF(preferred_spaces), preferred_spaces);
+	// Like the color math, the room light assumes sRGB-encoded 8-bit input.
+	if (f->room_blend > 0.0f && space == GS_CS_SRGB)
+		render_room_maps(f);
+	const bool use_room = f->room_blend > 0.0f && space == GS_CS_SRGB && f->room_ready;
+
 	if (!obs_source_process_filter_begin_with_color_space(f->context, gs_get_format_from_space(space), space,
 							      OBS_ALLOW_DIRECT_RENDERING))
 		return;
@@ -2091,6 +2313,23 @@ static void rvm_video_render(void *data, gs_effect_t *unused)
 	vec3_set(&gain, state[0], state[1], state[2]);
 	gs_effect_set_vec3(f->param_gain, &gain);
 	gs_effect_set_float(f->param_lift, state[3]);
+	// The reach is the same distance across and down on a picture of any shape.
+	struct vec2 edge_reach;
+	vec2_zero(&edge_reach);
+	if (f->clean_edges)
+		vec2_set(&edge_reach, kEdgeReach * (float)f->matte_height / (float)f->matte_width, kEdgeReach);
+	gs_effect_set_vec2(f->param_edge_reach, &edge_reach);
+	// The shader skips the room maps at a blend of 0, but they must still be set.
+	gs_effect_set_texture(f->param_room_wrap,
+			      use_room ? gs_texrender_get_texture(f->room_maps[kRoomWrapMap]) : f->matte_tex);
+	gs_effect_set_texture(f->param_room_light,
+			      use_room ? gs_texrender_get_texture(f->room_maps[kRoomLightMap]) : f->matte_tex);
+	gs_effect_set_texture(f->param_room_mean,
+			      use_room ? gs_texrender_get_texture(f->room_maps[kRoomMeanMap]) : f->matte_tex);
+	gs_effect_set_float(f->param_room_blend, use_room ? f->room_blend : 0.0f);
+	struct vec2 room_reach;
+	vec2_set(&room_reach, kRoomEdgeReach * (float)f->matte_height / (float)f->matte_width, kRoomEdgeReach);
+	gs_effect_set_vec2(f->param_room_reach, &room_reach);
 
 	gs_blend_state_push();
 	gs_blend_function(GS_BLEND_ONE, GS_BLEND_INVSRCALPHA);
@@ -2105,6 +2344,9 @@ static void rvm_defaults(obs_data_t *settings)
 	obs_data_set_default_double(settings, "alpha_low", 0.25);
 	obs_data_set_default_double(settings, "alpha_high", 0.75);
 	obs_data_set_default_double(settings, "edge_stability", 0.85);
+	obs_data_set_default_bool(settings, "clean_edges", true);
+	obs_data_set_default_string(settings, "room_source", "");
+	obs_data_set_default_double(settings, "room_blend", 0.5);
 	obs_data_set_default_bool(settings, "sync_video", true);
 	obs_data_set_default_bool(settings, "use_plate", false);
 	obs_data_set_default_bool(settings, "auto_color", false);
@@ -2185,8 +2427,8 @@ static bool rvm_capture_plate_clicked(obs_properties_t *props, obs_property_t *p
 	UNUSED_PARAMETER(props);
 	UNUSED_PARAMETER(property);
 	struct rvm_filter *f = data;
-	if (f->countdown_label > 0)
-		return false; // already counting down or capturing
+	if (!f || f->countdown_label > 0)
+		return false; // not created, or already counting down or capturing
 
 	// Taking a photo means wanting to use it.
 	obs_data_t *settings = obs_source_get_settings(f->context);
@@ -2213,6 +2455,8 @@ static bool rvm_forget_plate_clicked(obs_properties_t *props, obs_property_t *pr
 	UNUSED_PARAMETER(props);
 	UNUSED_PARAMETER(property);
 	struct rvm_filter *f = data;
+	if (!f)
+		return false;
 	os_atomic_set_bool(&f->plate_forget_requested, true);
 	os_atomic_set_bool(&f->plate_capture_requested, false);
 	f->countdown_label = 0;
@@ -2234,6 +2478,23 @@ static void rvm_set_help(obs_property_t *property, const char *key)
 	char text[1024];
 	snprintf(text, sizeof(text), "<qt>%s</qt>", obs_module_text(key));
 	obs_property_set_long_description(property, text);
+}
+
+struct room_list {
+	obs_property_t *property;
+	obs_source_t *parent;
+};
+
+// Lists every input with a picture that does not show the camera this filter is
+// on. OBS does not offer scenes here, and groups are left out.
+static bool rvm_add_room_source(void *data, obs_source_t *source)
+{
+	struct room_list *list = data;
+	const char *name = obs_source_get_name(source);
+	if (name && !obs_source_is_group(source) && (obs_source_get_output_flags(source) & OBS_SOURCE_VIDEO) &&
+	    !room_contains(source, list->parent))
+		obs_property_list_add_string(list->property, name, name);
+	return true;
 }
 
 static obs_properties_t *rvm_properties(void *data)
@@ -2263,12 +2524,24 @@ static obs_properties_t *rvm_properties(void *data)
 	obs_property_t *stability = obs_properties_add_float_slider(props, "edge_stability",
 								     obs_module_text("EdgeStability"), 0.0, 1.0, 0.05);
 	rvm_set_help(stability, "EdgeStability.Description");
+	obs_property_t *clean_edges = obs_properties_add_bool(props, "clean_edges", obs_module_text("CleanEdges"));
+	rvm_set_help(clean_edges, "CleanEdges.Description");
 	obs_property_t *sync = obs_properties_add_bool(props, "sync_video", obs_module_text("SyncVideo"));
 	rvm_set_help(sync, "SyncVideo.Description");
 
 	obs_property_t *auto_color = obs_properties_add_bool(props, "auto_color", obs_module_text("AutoColor"));
 	rvm_set_help(auto_color, "AutoColor.Description");
 
+	obs_property_t *room = obs_properties_add_list(props, "room_source", obs_module_text("RoomSource"),
+						       OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_STRING);
+	obs_property_list_add_string(room, obs_module_text("RoomSource.None"), "");
+	const struct rvm_filter *room_filter = data;
+	struct room_list room_list = {room, room_filter ? obs_filter_get_parent(room_filter->context) : NULL};
+	obs_enum_sources(rvm_add_room_source, &room_list);
+	rvm_set_help(room, "RoomSource.Description");
+	obs_property_t *room_blend = obs_properties_add_float_slider(props, "room_blend", obs_module_text("RoomBlend"),
+								      0.0, 1.0, 0.05);
+	rvm_set_help(room_blend, "RoomBlend.Description");
 
 	obs_property_t *use_plate = obs_properties_add_bool(props, "use_plate", obs_module_text("UsePlate"));
 	rvm_set_help(use_plate, "UsePlate.Description");
