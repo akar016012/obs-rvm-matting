@@ -6,8 +6,20 @@ All notable changes to this project are recorded in this file. The format follow
 
 ### Added
 
-- **Automatic color** corrects brightness from the scene's highlights and white balance from plain background areas, gradually, without letting skin set the white balance.
+- **Automatic color** corrects brightness from the scene's highlights and partly corrects white balance from plain background areas, gradually, without letting skin set the white balance and without washing out skin.
 - A debug snapshot now also logs the camera's raw color (skin, bright background, dark clothing and brightness spread), for tuning OBS's color correction without saving the picture.
+- `build.sh` builds the High accuracy model from other ResNet-50 weights when `RVM_RESNET50_WEIGHTS` is set.
+- The cutout holds up better in dim rooms, because dim frames are brightened for the model only. The picture viewers see does not change.
+- Every setting now has a **?** help tooltip.
+- **Use empty-background photo** now averages several frames, follows exposure changes, needs a much closer color match so it no longer cuts into necks and shoulders, and can open thin gaps such as the space beside a headband. Its capture button now counts down with sounds, and each filter now keeps its own photo. A photo saved by an earlier version goes to the first filter that loads, so other filters need a new one.
+
+### Removed
+
+- **Remove my red chair** is gone, because a rule for one color of chair does not help most people. Any saved setting for the old option is ignored.
+
+### Fixed
+
+- A speckled cutout no longer opens gaps in the protected middle of the body.
 
 ## 1.0.0 - 2026-11-03
 

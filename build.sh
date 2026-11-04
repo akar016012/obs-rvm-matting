@@ -5,6 +5,10 @@
 # Builds obs-rvm-matting.plugin for the OBS installed in /Applications.
 # Usage: ./build.sh            builds into build/
 #        ./build.sh --install  also copies the plugin into OBS's user plugins folder
+#
+# Setting RVM_RESNET50_WEIGHTS to a ResNet-50 .pth file builds the High accuracy model from that file
+# instead of the v1.0.0 release weights:
+#        RVM_RESNET50_WEIGHTS=path/to/weights.pth ./build.sh --install
 set -euo pipefail
 
 here="$(cd "$(dirname "$0")" && pwd)"
@@ -50,12 +54,22 @@ fi
 
 # Robust Video Matting models (GPL-3.0), converted from the PyTorch weights
 # by tools/convert_model.py. Conversion takes a few minutes per model and
-# only runs when the compiled model is missing.
+# only runs when the compiled model is missing. A model from custom weights
+# is kept in a folder named after the weights' SHA-256, so changing the
+# weights converts again and unsetting the variable goes back to the release.
+custom_weights="${RVM_RESNET50_WEIGHTS:-}"
 models=()
 for v in "${variants[@]}"; do
 	m="rvm_alpha_${v}_1920x1080_s0.25"
-	models+=("$m")
-	[ -d "$build/models/$m.mlmodelc" ] && continue
+	out="$build/models"
+	weights="$build/models/rvm_$v.pth"
+	if [ "$v" = resnet50 ] && [ -n "$custom_weights" ]; then
+		weights="$(cd "$(dirname "$custom_weights")" && pwd)/$(basename "$custom_weights")"
+		out="$build/models/custom-$(shasum -a 256 "$weights" | cut -c1-16)"
+		echo "Using custom ResNet-50 weights $weights"
+	fi
+	models+=("$out/$m.mlmodelc")
+	[ -d "$out/$m.mlmodelc" ] && continue
 
 	rvm="$build/rvm-$rvm_commit"
 	if [ ! -f "$rvm/model/model.py" ]; then
@@ -64,19 +78,21 @@ for v in "${variants[@]}"; do
 		git -C "$rvm" fetch -q --depth 1 https://github.com/PeterL1n/RobustVideoMatting.git "$rvm_commit"
 		git -C "$rvm" -c advice.detachedHead=false checkout -q FETCH_HEAD
 	fi
-	mkdir -p "$build/models"
-	[ -f "$build/models/rvm_$v.pth" ] || curl -fsSL -o "$build/models/rvm_$v.pth" "$weights_url/rvm_$v.pth"
-	if ! echo "$(weights_sha256 "$v")  $build/models/rvm_$v.pth" | shasum -a 256 -c --status; then
-		echo "rvm_$v.pth does not match its expected SHA-256; delete it and run the build again" >&2
-		exit 1
+	mkdir -p "$out"
+	if [ "$out" = "$build/models" ]; then
+		[ -f "$weights" ] || curl -fsSL -o "$weights" "$weights_url/rvm_$v.pth"
+		if ! echo "$(weights_sha256 "$v")  $weights" | shasum -a 256 -c --status; then
+			echo "rvm_$v.pth does not match its expected SHA-256; delete it and run the build again" >&2
+			exit 1
+		fi
 	fi
 
 	echo "Converting $m"
 	uv run --no-project --python 3.12 \
 		--with torch==2.5.0 --with torchvision==0.20.0 --with coremltools==8.3.0 --with 'numpy<2' \
-		python "$here/tools/convert_model.py" "$rvm" "$build/models/rvm_$v.pth" "$build/models/$m.mlpackage" \
+		python "$here/tools/convert_model.py" "$rvm" "$weights" "$out/$m.mlpackage" \
 		--variant "$v" --width 1920 --height 1080 --downsample 0.25
-	xcrun coremlcompiler compile "$build/models/$m.mlpackage" "$build/models" >/dev/null
+	xcrun coremlcompiler compile "$out/$m.mlpackage" "$out" >/dev/null
 done
 
 bundle="$build/$name.plugin"
@@ -88,14 +104,14 @@ clang -fobjc-arc -fmodules -O2 -arch arm64 -mmacosx-version-min=13.0 -bundle \
 	-I "$headers/libobs" -I "$simde" -I "$build/include" \
 	-F "$obs_app/Contents/Frameworks" -framework libobs \
 	-framework Foundation -framework CoreML -framework CoreVideo -framework VideoToolbox \
-	-framework Accelerate -framework ImageIO -framework UniformTypeIdentifiers -framework CoreGraphics \
+	-framework Accelerate -framework AppKit -framework ImageIO -framework UniformTypeIdentifiers -framework CoreGraphics \
 	-Wl,-rpath,@executable_path/../Frameworks \
 	-o "$bundle/Contents/MacOS/$name" "$here/src/rvm-matting.m"
 
 cp "$here/Info.plist" "$bundle/Contents/Info.plist"
 cp -R "$here/data/." "$bundle/Contents/Resources/"
 for m in "${models[@]}"; do
-	cp -R "$build/models/$m.mlmodelc" "$bundle/Contents/Resources/"
+	cp -R "$m" "$bundle/Contents/Resources/"
 done
 codesign --force --sign - "$bundle"
 echo "Built $bundle"

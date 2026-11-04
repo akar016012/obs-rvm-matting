@@ -22,6 +22,7 @@
 #import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
 #import <VideoToolbox/VideoToolbox.h>
 #import <Accelerate/Accelerate.h>
+#import <AppKit/AppKit.h>
 
 #include <obs-module.h>
 #include <util/platform.h>
@@ -74,47 +75,57 @@ static const uint64_t kSyncGiveUpNs = 500000000ULL;
 // they do, new frames are not sent to the model.
 static const int kMaxPostPending = 2;
 // A photo of the empty background is compared with each frame. Where the
-// average color difference is at most kPlateMatchLow levels the pixel is
-// background and is cut out; from kPlateMatchHigh up it is left to the model.
-static const float kPlateMatchLow = 10.0f;
-static const float kPlateMatchHigh = 28.0f;
+// largest color difference of any channel is at most kPlateMatchLow levels
+// the pixel is background and is cut out; from kPlateMatchHigh up it is left
+// to the model. Both are raised by kPlateNoiseScale times each pixel's camera
+// noise. The limits are tight so that skin cannot pass for a wall.
+static const float kPlateMatchLow = 5.0f;
+static const float kPlateMatchHigh = 14.0f;
+static const float kPlateNoiseScale = 1.0f;
+// Apart from thin gaps, the photo only cuts pixels the model is unsure about,
+// below this matte value. Otherwise any skin close to the wall color would go.
+static const uint8_t kPlateSureMatte = 250;
+// The photo averages this many frames, which also measures each pixel's noise.
+// The noise is saved beside the photo; a photo without it uses kPlateNoiseDefault.
+static const int kPlateCaptureFrames = 30;
+static const uint8_t kPlateNoiseDefault = 1;
+// Camera exposure shifts when someone sits down, so the frame is matched to
+// the photo first: each channel's gain comes from pixels the model calls
+// background, sampled every kPlateGainStep pixels, within kPlateGainMin..Max.
+static const size_t kPlateGainStep = 8;
+static const float kPlateGainMin = 0.7f;
+static const float kPlateGainMax = 1.4f;
+static const float kPlateGainRate = 0.1f;
+// Thin gaps, such as the room showing between a headband and a temple, may be
+// cut even inside the protected middle of the person. A pixel qualifies if it
+// matches the photo within kPlateGapMatch levels, belongs to a match narrower
+// than kPlateGapWidth pixels (odd), survives a kPlateGapSpeck window (odd),
+// lies within kPlateGapReach motion-grid cells (odd, so about half that
+// across) of the person's edge, and is in the upper half of the person. Those
+// last two keep the gap rule on the head and away from patterned clothes.
+static const float kPlateGapMatch = 6.0f;
+static const vImagePixelCount kPlateGapWidth = 41;
+static const vImagePixelCount kPlateGapSpeck = 3;
+static const vImagePixelCount kPlateGapReach = 33;
 // The color difference is averaged over this many pixels (odd) to ignore
 // camera noise.
 static const vImagePixelCount kPlateBlur = 5;
 // The solid middle of the person, shrunk by this many motion-grid cells
-// (odd), is never cut by the photo or by chair removal, so clothes that
-// match what is behind them keep no holes.
+// (odd), is not cut by the photo, apart from thin gaps, so clothes that match
+// what is behind them stay whole.
 static const vImagePixelCount kCoreShrink = 9;
+// Gaps in the solid middle narrower than this many cells (odd) are filled
+// first. Without this, one speckled cell in the matte would remove a whole
+// kCoreShrink square of protection.
+static const vImagePixelCount kCoreGapFill = 3;
 // Where the model is sure it sees background and nothing moves, the photo
-// drifts toward the live picture by 1/16 per matte, following lighting.
-static const int kPlateAdaptShift = 4;
+// creeps toward the live picture by one level every kPlateAdaptEvery mattes,
+// following slow lighting drift. Differences of kPlateAdaptLimit levels or more
+// are ignored, so a moment of model doubt can never teach the photo a person.
+static const int kPlateAdaptEvery = 8;
+static const int kPlateAdaptLimit = 24;
 // The photo is taken this long after the capture button is clicked.
 static const double kPlateCaptureDelaySeconds = 5.0;
-// Chair removal: a color counts as chair once (red - green) / red reaches
-// kChairRednessLow and fully at kChairRednessHigh, and only when red is at
-// least kChairMinRed, so the black rim and shadows are not chair on their own.
-static const float kChairRednessLow = 0.35f;
-static const float kChairRednessHigh = 0.5f;
-static const float kChairMinRed = 25.0f;
-// ... and once (blue - green) / red reaches kChairMagentaLow, fully at
-// kChairMagentaHigh.
-static const float kChairMagentaLow = 0.0f;
-static const float kChairMagentaHigh = 0.1f;
-// The frame is blurred over this many pixels (odd) before scoring, so the
-// mesh's black threads blend into its red.
-static const vImagePixelCount kChairBlur = 11;
-// The cut is widened by this many pixels (odd) to take the chair's rim.
-static const vImagePixelCount kChairRim = 9;
-// Pixels the model counts as mostly the person (at least this matte value)
-// are judged on a frame blurred over only kChairFineBlur pixels (odd), so
-// they are cut only if they look like chair themselves. This keeps the soft
-// edge of a black earcup in front of the chair from being nibbled away.
-static const uint8_t kChairSureMatte = 128;
-static const vImagePixelCount kChairFineBlur = 3;
-// Within this many pixels (odd) of the cut, strips of the matte thinner
-// than kChairSliver pixels (odd) are removed, which takes the leftover rim.
-static const vImagePixelCount kChairCleanupReach = 41;
-static const vImagePixelCount kChairSliver = 9;
 // Automatic color: every kAutoColorEvery mattes the frame is measured to set
 // new targets, and on every matte the color moves kAutoColorRate of the way
 // toward them. Small steps on every frame settle over a few seconds without
@@ -128,18 +139,32 @@ static const float kAutoColorRate = 0.02f;
 static const float kAutoHighlightTarget = 0.80f;
 static const float kAutoGainMin = 0.7f;
 static const float kAutoGainMax = 3.0f;
-// White balance makes plain background areas (walls) neutral. It needs at
-// least this share of the measured pixels, and each channel's correction
+// White balance moves plain background areas (walls) part of the way toward
+// neutral: kAutoBalanceStrength of the full correction, because many walls
+// really are warm, and a full correction turns skin cool and pale. It needs
+// at least this share of the measured pixels, and each channel's correction
 // stays within kAutoBalanceMin..Max.
 static const float kAutoBalanceMinShare = 0.005f;
 static const float kAutoBalanceMin = 0.75f;
 static const float kAutoBalanceMax = 1.33f;
+static const float kAutoBalanceStrength = 0.35f;
 // After the gain, mid-tones are lifted with this power in linear light, much
 // like a phone camera's tone curve.
-static const float kAutoColorLift = 0.8f;
+static const float kAutoColorLift = 0.92f;
 // Exposure is measured on the background when it makes up at least this
 // share of the frame, and on the whole frame otherwise.
 static const float kAutoBackgroundMinShare = 0.05f;
+
+// Low light: the model cuts better on a bright picture, so a dark frame is
+// lifted for the model only. Viewers keep the normal picture. The frame's mean
+// linear brightness, sampled every kLiftSampleStep pixels, is brought up to
+// kLiftTarget, by at most kLiftMax, moving kLiftRate of the way each frame.
+static const float kLiftTarget = 0.18f;
+static const float kLiftMax = 8.0f;
+static const float kLiftRate = 0.05f;
+static const size_t kLiftSampleStep = 16;
+// Gains closer to 1 than this leave the frame alone.
+static const float kLiftMinimum = 1.03f;
 
 // Both models take 1920x1080 frames and return a 1920x1080 matte; see
 // tools/convert_model.py.
@@ -168,8 +193,6 @@ struct edge_flicker {
 @property (atomic) uint64_t request;
 // Whether the empty-background photo, if there is one, is used.
 @property (atomic) BOOL usePlate;
-// Whether a red chair behind the person is always cut out.
-@property (atomic) BOOL removeChair;
 // Whether exposure and white balance are corrected automatically.
 @property (atomic) BOOL autoColor;
 // The current automatic color state: red, green and blue gains in linear
@@ -183,16 +206,19 @@ struct edge_flicker {
 - (instancetype)initWithModelPath:(NSString *)path
 		     computeUnits:(MLComputeUnits)units
 			platePath:(NSString *)platePath;
-// Takes the empty-background photo from the first frame after this many
+// Starts averaging frames for the empty-background photo after this many
 // seconds, so there is time to step out of view.
 - (void)requestPlateCaptureIn:(double)seconds;
+// Seconds until capture starts, 0 while capturing, and -1 when idle.
+- (double)plateCaptureRemaining;
+// When capture starts, or 0 when idle, so a switch of model keeps a capture.
+@property (atomic) double plateCaptureTime;
 - (void)requestPlateForget;
 // Whether frames in this frame's pixel format can be sent to the model.
 - (BOOL)acceptsFrame:(const struct obs_source_frame *)frame;
 - (BOOL)submitFrame:(const struct obs_source_frame *)frame;
 // Copies the newest matte made from a frame no later than timestamp into dst,
-// unless that matte is the one already copied (*generation). Each pixel is
-// two bytes: the matte, then the chair spill strength.
+// unless that matte is the one already copied (*generation).
 - (BOOL)copyMatteFor:(uint64_t)timestamp
 	  generation:(uint64_t *)generation
 		into:(uint8_t **)dst
@@ -254,12 +280,26 @@ struct edge_flicker {
 	uint32_t _gridHeight;
 	BOOL _motionValid;
 
+	// Owned by the model queue: the low-light lift.
+	float _liftGain;
+	float _liftTableGain;
+	Pixel_8 _liftTable[256];
+	Pixel_8 _liftAlpha[256];
 	// Owned by the publish queue: the empty-background photo (BGRA at the
 	// model size) and the blurred color difference to it.
 	NSString *_platePath;
 	uint8_t *_plate;
 	uint8_t *_plateDiff;
 	uint8_t *_plateDiffBlur;
+	uint8_t *_plateNoise;
+	uint8_t *_plateGap;
+	uint8_t *_plateGapWide;
+	uint8_t *_plateGapThin;
+	uint32_t *_plateSum;
+	uint32_t *_plateSumSquares;
+	int _plateFrames;
+	int _plateAdaptCount;
+	float _plateGain[3];
 	BOOL _plateValid;
 
 	// Owned by the publish queue: the person's solid middle on the motion
@@ -269,20 +309,10 @@ struct edge_flicker {
 	uint32_t _coreWidth;
 	uint32_t _coreHeight;
 
-	// Set from the OBS video thread, read on the publish queue.
+	// Read and written on the OBS video thread, and on the publish queue, which clears it when the capture ends.
 	_Atomic double _plateCaptureAt;
 	_Atomic bool _plateForgetRequested;
 
-	// Owned by the publish queue: chair removal buffers. _chairCut holds how
-	// much of each pixel was cut from the latest matte while _chairMaskValid
-	// is set.
-	uint8_t *_chairBlur;
-	uint8_t *_chairFine;
-	uint8_t *_chairScore;
-	uint8_t *_chairCut;
-	uint8_t *_chairNear;
-	uint8_t *_chairOpened;
-	BOOL _chairMaskValid;
 
 	NSString *_snapshotPath;
 	int _snapshotCountdown;
@@ -401,14 +431,14 @@ struct edge_flicker {
 	free(_plate);
 	free(_plateDiff);
 	free(_plateDiffBlur);
+	free(_plateNoise);
+	free(_plateGap);
+	free(_plateGapWide);
+	free(_plateGapThin);
+	free(_plateSum);
+	free(_plateSumSquares);
 	free(_coreSource);
 	free(_core);
-	free(_chairBlur);
-	free(_chairFine);
-	free(_chairScore);
-	free(_chairCut);
-	free(_chairNear);
-	free(_chairOpened);
 }
 
 // Runs on the model queue. The publish queue restarts its smoothing and
@@ -602,6 +632,22 @@ static void copy_plane(uint8_t *dst, size_t dst_stride, const uint8_t *src, size
 	_plateCaptureAt = CFAbsoluteTimeGetCurrent() + seconds;
 }
 
+- (double)plateCaptureTime
+{
+	return _plateCaptureAt;
+}
+
+- (void)setPlateCaptureTime:(double)time
+{
+	_plateCaptureAt = time;
+}
+
+- (double)plateCaptureRemaining
+{
+	double at = _plateCaptureAt;
+	return at > 0 ? MAX(0.0, at - CFAbsoluteTimeGetCurrent()) : -1.0;
+}
+
 - (void)requestPlateForget
 {
 	_plateForgetRequested = true;
@@ -615,11 +661,98 @@ static void copy_plane(uint8_t *dst, size_t dst_stride, const uint8_t *src, size
 	_plate = malloc(count * 4);
 	_plateDiff = malloc(count);
 	_plateDiffBlur = malloc(count);
+	_plateNoise = malloc(count);
+	memset(_plateNoise, kPlateNoiseDefault, count);
+	_plateGap = malloc(count);
+	_plateGapWide = malloc(count);
+	_plateGapThin = malloc(count);
+	_plateGain[0] = _plateGain[1] = _plateGain[2] = 1.0f;
+}
+
+// Adds a frame to the photo being captured. Once there are enough, stores
+// their average as the photo and the spread of each pixel as its noise.
+- (void)addPlateFrame:(const uint8_t *)frame stride:(size_t)stride width:(uint32_t)width height:(uint32_t)height
+{
+	size_t count = (size_t)width * height;
+	if (!_plateSum) {
+		_plateSum = calloc(count * 3, sizeof(uint32_t));
+		_plateSumSquares = calloc(count, sizeof(uint32_t));
+		_plateFrames = 0;
+	}
+	for (uint32_t y = 0; y < height; y++) {
+		const uint8_t *p = frame + y * stride;
+		uint32_t *sum = _plateSum + (size_t)y * width * 3;
+		uint32_t *squares = _plateSumSquares + (size_t)y * width;
+		for (uint32_t x = 0; x < width; x++, p += 4, sum += 3) {
+			sum[0] += p[0];
+			sum[1] += p[1];
+			sum[2] += p[2];
+			uint32_t total = (uint32_t)p[0] + p[1] + p[2];
+			squares[x] += total * total;
+		}
+	}
+	if (++_plateFrames < kPlateCaptureFrames)
+		return;
+
+	float n = (float)_plateFrames;
+	for (size_t i = 0; i < count; i++) {
+		const uint32_t *sum = _plateSum + i * 3;
+		uint8_t *q = _plate + i * 4;
+		q[0] = (uint8_t)((float)sum[0] / n + 0.5f);
+		q[1] = (uint8_t)((float)sum[1] / n + 0.5f);
+		q[2] = (uint8_t)((float)sum[2] / n + 0.5f);
+		q[3] = 255;
+		// Spread of the pixel's brightness, the mean of its three channels.
+		float mean = (float)(sum[0] + sum[1] + sum[2]) / (3.0f * n);
+		float variance = fmaxf(0.0f, (float)_plateSumSquares[i] / (9.0f * n) - mean * mean);
+		_plateNoise[i] = (uint8_t)fminf(20.0f, sqrtf(variance) + 0.5f);
+	}
+	free(_plateSum);
+	free(_plateSumSquares);
+	_plateSum = NULL;
+	_plateSumSquares = NULL;
+	_plateCaptureAt = 0;
+	_plateGain[0] = _plateGain[1] = _plateGain[2] = 1.0f;
+	_plateValid = YES;
+	[self savePlate];
+	blog_rvm(LOG_INFO, "Captured background photo from %d frames", _plateFrames);
+}
+
+// Updates the gains that match the frame to the photo, from pixels the model
+// is sure are background.
+- (void)updatePlateGainFrom:(const uint8_t *)frame
+		     stride:(size_t)stride
+		      matte:(const uint8_t *)matte
+		      width:(uint32_t)width
+		     height:(uint32_t)height
+{
+	double live[3] = {0}, photo[3] = {0};
+	size_t samples = 0;
+	for (uint32_t y = 0; y < height; y += kPlateGainStep) {
+		for (uint32_t x = 0; x < width; x += kPlateGainStep) {
+			if (matte[(size_t)y * width + x] >= 8)
+				continue;
+			const uint8_t *p = frame + y * stride + (size_t)x * 4;
+			const uint8_t *q = _plate + ((size_t)y * width + x) * 4;
+			for (int c = 0; c < 3; c++) {
+				live[c] += p[c];
+				photo[c] += q[c];
+			}
+			samples++;
+		}
+	}
+	if (samples < 200)
+		return;
+	for (int c = 0; c < 3; c++) {
+		float target = live[c] > 0 ? (float)(photo[c] / live[c]) : 1.0f;
+		target = fminf(kPlateGainMax, fmaxf(kPlateGainMin, target));
+		_plateGain[c] += (target - _plateGain[c]) * kPlateGainRate;
+	}
 }
 
 // Marks the person's solid middle on the motion grid: cells that are fully
-// opaque in the model's matte, shrunk inwards by kCoreShrink cells. Neither
-// the photo nor chair removal ever cuts inside it.
+// opaque in the model's matte, with small gaps filled, shrunk inward by
+// kCoreShrink cells. The photo only cuts thin gaps inside it.
 - (void)updateCoreFrom:(const uint8_t *)matte width:(uint32_t)width height:(uint32_t)height
 {
 	uint32_t gw = width / kMotionGridScale;
@@ -639,14 +772,22 @@ static void copy_plane(uint8_t *dst, size_t dst_stride, const uint8_t *src, size
 	}
 	vImage_Buffer core_source = {.data = _coreSource, .height = gh, .width = gw, .rowBytes = gw};
 	vImage_Buffer core = {.data = _core, .height = gh, .width = gw, .rowBytes = gw};
-	vImageMin_Planar8(&core_source, &core, NULL, 0, 0, kCoreShrink, kCoreShrink, kvImageEdgeExtend);
+	// Filling grows the shape by kCoreGapFill - 1 cells across, so the shrink
+	// takes that back as well.
+	vImageMax_Planar8(&core_source, &core, NULL, 0, 0, kCoreGapFill, kCoreGapFill, kvImageEdgeExtend);
+	vImagePixelCount shrink = kCoreShrink + kCoreGapFill - 1;
+	vImageMin_Planar8(&core, &core_source, NULL, 0, 0, shrink, shrink, kvImageEdgeExtend);
+	memcpy(_core, _coreSource, (size_t)gw * gh);
 }
 
-// One adaptation step toward the live picture, rounded to the nearest level.
-static inline int adapt_step(int d)
+// Moves one color level of the photo one step toward the live picture.
+static inline uint8_t adapt_level(uint8_t q, int d)
 {
-	const int half = 1 << (kPlateAdaptShift - 1);
-	return (d + (d > 0 ? half : -half)) / (1 << kPlateAdaptShift);
+	if (d > 0 && q < 255)
+		return (uint8_t)(q + 1);
+	if (d < 0 && q > 0)
+		return (uint8_t)(q - 1);
+	return q;
 }
 
 static CGContextRef create_bgra_context(void *data, size_t width, size_t height)
@@ -678,6 +819,9 @@ static CGContextRef create_bgra_context(void *data, size_t width, size_t height)
 		CGContextDrawImage(ctx, CGRectMake(0, 0, _modelWidth, _modelHeight), image);
 		CGContextRelease(ctx);
 		_plateValid = YES;
+		NSData *noise = [NSData dataWithContentsOfFile:[_platePath stringByAppendingString:@".noise"]];
+		if (noise.length == (size_t)_modelWidth * _modelHeight)
+			memcpy(_plateNoise, noise.bytes, noise.length);
 		blog_rvm(LOG_INFO, "Loaded background photo");
 	}
 	CGImageRelease(image);
@@ -687,6 +831,10 @@ static CGContextRef create_bgra_context(void *data, size_t width, size_t height)
 {
 	if (!_platePath.length)
 		return;
+	NSData *noise = [NSData dataWithBytesNoCopy:_plateNoise
+					     length:(size_t)_modelWidth * _modelHeight
+				       freeWhenDone:NO];
+	[noise writeToFile:[_platePath stringByAppendingString:@".noise"] atomically:YES];
 	CGContextRef ctx = create_bgra_context(_plate, _modelWidth, _modelHeight);
 	CGImageRef image = ctx ? CGBitmapContextCreateImage(ctx) : NULL;
 	if (image) {
@@ -706,7 +854,7 @@ static CGContextRef create_bgra_context(void *data, size_t width, size_t height)
 		CGContextRelease(ctx);
 }
 
-// Cuts out pixels that match the empty-background photo, except in the solid
+// Cuts out pixels that match the empty-background photo, apart from the solid
 // middle of the person, and lets the photo follow slow lighting changes.
 // Runs on the publish queue with the model's raw matte, before smoothing.
 - (void)applyPlateTo:(uint8_t *)matte width:(uint32_t)width height:(uint32_t)height frame:(CVPixelBufferRef)bgra
@@ -714,8 +862,15 @@ static CGContextRef create_bgra_context(void *data, size_t width, size_t height)
 	if (_plateForgetRequested) {
 		_plateForgetRequested = false;
 		_plateValid = NO;
-		if (_platePath.length)
-			[[NSFileManager defaultManager] removeItemAtPath:_platePath error:nil];
+		free(_plateSum);
+		free(_plateSumSquares);
+		_plateSum = NULL;
+		_plateSumSquares = NULL;
+		if (_platePath.length) {
+			NSFileManager *files = [NSFileManager defaultManager];
+			[files removeItemAtPath:_platePath error:nil];
+			[files removeItemAtPath:[_platePath stringByAppendingString:@".noise"] error:nil];
+		}
 		blog_rvm(LOG_INFO, "Forgot background photo");
 	}
 	if (width != _modelWidth || height != _modelHeight || CVPixelBufferGetWidth(bgra) != width ||
@@ -727,14 +882,16 @@ static CGContextRef create_bgra_context(void *data, size_t width, size_t height)
 	size_t stride = CVPixelBufferGetBytesPerRow(bgra);
 
 	double capture_at = _plateCaptureAt;
-	if (capture_at > 0 && CFAbsoluteTimeGetCurrent() >= capture_at) {
-		_plateCaptureAt = 0;
+	BOOL capturing = capture_at > 0 && CFAbsoluteTimeGetCurrent() >= capture_at;
+	if (!capturing && _plateSum) {
+		free(_plateSum);
+		free(_plateSumSquares);
+		_plateSum = NULL;
+		_plateSumSquares = NULL;
+	}
+	if (capturing) {
 		[self allocatePlateBuffers];
-		for (uint32_t y = 0; y < height; y++)
-			memcpy(_plate + (size_t)y * width * 4, frame + y * stride, (size_t)width * 4);
-		_plateValid = YES;
-		[self savePlate];
-		blog_rvm(LOG_INFO, "Captured background photo");
+		[self addPlateFrame:frame stride:stride width:width height:height];
 	}
 	if (!_plateValid || !self.usePlate) {
 		CVPixelBufferUnlockBaseAddress(bgra, kCVPixelBufferLock_ReadOnly);
@@ -744,6 +901,10 @@ static CGContextRef create_bgra_context(void *data, size_t width, size_t height)
 	uint32_t gw = width / kMotionGridScale;
 	uint32_t gh = height / kMotionGridScale;
 	BOOL have_motion = _motionValid && _gridWidth == gw && _gridHeight == gh;
+
+	[self updatePlateGainFrom:frame stride:stride matte:matte width:width height:height];
+	const float gain_b = _plateGain[0], gain_g = _plateGain[1], gain_r = _plateGain[2];
+	const BOOL adapt = ++_plateAdaptCount % kPlateAdaptEvery == 0;
 
 	// Color difference to the photo, and slow adaptation of the photo where
 	// the model is sure this is background and the picture is still.
@@ -755,13 +916,16 @@ static CGContextRef create_bgra_context(void *data, size_t width, size_t height)
 		const uint8_t *motion_row =
 			have_motion ? _motion + (size_t)MIN(y / kMotionGridScale, gh - 1) * gw : NULL;
 		for (uint32_t x = 0; x < width; x++, p += 4, q += 4) {
-			int db = p[0] - q[0], dg = p[1] - q[1], dr = p[2] - q[2];
-			d[x] = (uint8_t)((abs(db) + abs(dg) + abs(dr)) / 3);
-			if (motion_row && m[x] < 8 &&
+			int db = MIN(255, (int)((float)p[0] * gain_b + 0.5f)) - q[0];
+			int dg = MIN(255, (int)((float)p[1] * gain_g + 0.5f)) - q[1];
+			int dr = MIN(255, (int)((float)p[2] * gain_r + 0.5f)) - q[2];
+			int largest = MAX(abs(db), MAX(abs(dg), abs(dr)));
+			d[x] = (uint8_t)MIN(255, largest);
+			if (adapt && motion_row && m[x] < 8 && largest < kPlateAdaptLimit &&
 			    motion_row[MIN(x / kMotionGridScale, gw - 1)] <= (uint8_t)kMotionNoiseFloor) {
-				q[0] = (uint8_t)(q[0] + adapt_step(db));
-				q[1] = (uint8_t)(q[1] + adapt_step(dg));
-				q[2] = (uint8_t)(q[2] + adapt_step(dr));
+				q[0] = adapt_level(q[0], db);
+				q[1] = adapt_level(q[1], dg);
+				q[2] = adapt_level(q[2], dr);
 			}
 		}
 	}
@@ -772,132 +936,153 @@ static CGContextRef create_bgra_context(void *data, size_t width, size_t height)
 	vImageBoxConvolve_Planar8(&diff, &blur, NULL, 0, 0, kPlateBlur, kPlateBlur, 0, kvImageEdgeExtend);
 
 
+	// Find thin gaps: exact matches, minus wide areas and single specks.
+	size_t count = (size_t)width * height;
+	for (size_t i = 0; i < count; i++) {
+		float limit = kPlateGapMatch + kPlateNoiseScale * (float)_plateNoise[i];
+		_plateGap[i] = matte[i] && (float)_plateDiffBlur[i] <= limit ? 255 : 0;
+	}
+	vImage_Buffer gap = {.data = _plateGap, .height = height, .width = width, .rowBytes = width};
+	vImage_Buffer wide = {.data = _plateGapWide, .height = height, .width = width, .rowBytes = width};
+	vImage_Buffer thin = {.data = _plateGapThin, .height = height, .width = width, .rowBytes = width};
+	// Wide areas are found on the motion grid, which is much cheaper than a
+	// kPlateGapWidth window at full size.
+	vImagePixelCount grid_window = (kPlateGapWidth / kMotionGridScale) | 1;
+	for (uint32_t y = 0; y < gh; y++) {
+		const uint8_t *row = _plateGap + ((size_t)y * kMotionGridScale + kMotionGridScale / 2) * width;
+		for (uint32_t x = 0; x < gw; x++)
+			_plateGapThin[(size_t)y * gw + x] = row[x * kMotionGridScale + kMotionGridScale / 2];
+	}
+	vImage_Buffer grid = {.data = _plateGapThin, .height = gh, .width = gw, .rowBytes = gw};
+	vImage_Buffer eroded = {.data = _plateGapWide, .height = gh, .width = gw, .rowBytes = gw};
+	// Close small misses first, so a speckled wide match still counts as wide.
+	vImageMax_Planar8(&grid, &eroded, NULL, 0, 0, 3, 3, kvImageEdgeExtend);
+	vImageMin_Planar8(&eroded, &grid, NULL, 0, 0, 3, 3, kvImageEdgeExtend);
+	vImageMin_Planar8(&grid, &eroded, NULL, 0, 0, grid_window, grid_window, kvImageEdgeExtend);
+	vImageMax_Planar8(&eroded, &grid, NULL, 0, 0, grid_window, grid_window, kvImageEdgeExtend);
+	vImageMax_Planar8(&grid, &eroded, NULL, 0, 0, 3, 3, kvImageEdgeExtend); // and the rims of wide areas
+
+	// Keep gaps to the edge of the upper half of the person.
+	size_t grid_count = (size_t)gw * gh;
+	uint8_t *person = _plateGapWide + grid_count;
+	uint8_t *middle = _plateGapWide + grid_count * 2;
+	uint32_t first_row = gh, last_row = 0;
+	for (uint32_t y = 0; y < gh; y++) {
+		const uint8_t *row = matte + ((size_t)y * kMotionGridScale + kMotionGridScale / 2) * width;
+		for (uint32_t x = 0; x < gw; x++) {
+			BOOL inside = row[x * kMotionGridScale + kMotionGridScale / 2] >= 128;
+			person[(size_t)y * gw + x] = inside ? 255 : 0;
+			if (inside) {
+				first_row = MIN(first_row, y);
+				last_row = MAX(last_row, y);
+			}
+		}
+	}
+	uint32_t row_limit = first_row + (last_row > first_row ? (last_row - first_row) / 2 : 0);
+	vImage_Buffer person_grid = {.data = person, .height = gh, .width = gw, .rowBytes = gw};
+	vImage_Buffer middle_grid = {.data = middle, .height = gh, .width = gw, .rowBytes = gw};
+	vImageMin_Planar8(&person_grid, &middle_grid, NULL, 0, 0, kPlateGapReach, kPlateGapReach, kvImageEdgeExtend);
+
+	for (uint32_t y = 0; y < height; y++) {
+		uint8_t *g = _plateGap + (size_t)y * width;
+		uint32_t cell_y = MIN(y / kMotionGridScale, gh - 1);
+		if (cell_y > row_limit) {
+			memset(g, 0, width);
+			continue;
+		}
+		const uint8_t *wide_row = _plateGapWide + (size_t)cell_y * gw;
+		const uint8_t *middle_row = middle + (size_t)cell_y * gw;
+		for (uint32_t x = 0; x < width; x++) {
+			uint32_t cell_x = MIN(x / kMotionGridScale, gw - 1);
+			if (wide_row[cell_x] || middle_row[cell_x])
+				g[x] = 0;
+		}
+	}
+	vImageMin_Planar8(&gap, &wide, NULL, 0, 0, kPlateGapSpeck, kPlateGapSpeck, kvImageEdgeExtend);
+	vImageMax_Planar8(&wide, &thin, NULL, 0, 0, kPlateGapSpeck, kPlateGapSpeck, kvImageEdgeExtend);
+
 	const float inv_range = 1.0f / (kPlateMatchHigh - kPlateMatchLow);
 	for (uint32_t y = 0; y < height; y++) {
 		uint8_t *m = matte + (size_t)y * width;
 		const uint8_t *b = _plateDiffBlur + (size_t)y * width;
+		const uint8_t *noise = _plateNoise + (size_t)y * width;
+		const uint8_t *gap_row = _plateGapThin + (size_t)y * width;
 		const uint8_t *core_row = _core + (size_t)MIN(y / kMotionGridScale, gh - 1) * gw;
 		for (uint32_t x = 0; x < width; x++) {
-			if (!m[x] || b[x] >= kPlateMatchHigh || core_row[MIN(x / kMotionGridScale, gw - 1)])
+			if (gap_row[x]) {
+				m[x] = 0;
 				continue;
-			float t = fmaxf(0.0f, ((float)b[x] - kPlateMatchLow) * inv_range);
+			}
+			float low = kPlateMatchLow + kPlateNoiseScale * (float)noise[x];
+			float value = (float)b[x] - low;
+			if (!m[x] || m[x] >= kPlateSureMatte || value * inv_range >= 1.0f ||
+			    core_row[MIN(x / kMotionGridScale, gw - 1)])
+				continue;
+			float t = fmaxf(0.0f, value * inv_range);
 			float keep = t * t * (3.0f - 2.0f * t);
 			m[x] = (uint8_t)((float)m[x] * keep + 0.5f);
 		}
 	}
 }
 
-#pragma mark Chair keeping
-
-// How strongly a color looks like the red chair mesh, from 0 to 1. Skin
-// can be as red as the mesh under a webcam, but its red leans toward
-// orange (more green than blue), while the mesh leans toward magenta (more
-// blue than green). Wood leans orange too.
-static inline float chair_score(int r, int g, int b)
+// Returns a brightened copy of a dark frame for the model, or NULL when the
+// frame is bright enough to use as it is.
+- (CVPixelBufferRef)newLiftedFrom:(CVPixelBufferRef)bgra CF_RETURNS_RETAINED
 {
-	if (r <= 0)
-		return 0.0f;
-	float redness = ((float)(r - g) / (float)r - kChairRednessLow) / (kChairRednessHigh - kChairRednessLow);
-	float magenta = ((float)(b - g) / (float)r - kChairMagentaLow) / (kChairMagentaHigh - kChairMagentaLow);
-	float brightness = ((float)r - kChairMinRed) / 30.0f;
-	return fminf(1.0f, fmaxf(0.0f, fminf(fminf(redness, magenta), brightness)));
-}
+	static float linear[256];
+	static dispatch_once_t once;
+	dispatch_once(&once, ^{
+		for (int i = 0; i < 256; i++)
+			linear[i] = powf((float)i / 255.0f, 2.2f);
+	});
 
-// Removes the red chair: chair-colored pixels outside the person's solid
-// middle are cut out, however sure the model is that they belong to the
-// person. Runs on the publish queue with the raw matte, before smoothing.
-- (void)applyChairTo:(uint8_t *)matte width:(uint32_t)width height:(uint32_t)height frame:(CVPixelBufferRef)bgra
-{
-	_chairMaskValid = NO;
-	if (!self.removeChair || width != _modelWidth || height != _modelHeight ||
-	    CVPixelBufferGetWidth(bgra) != width || CVPixelBufferGetHeight(bgra) != height)
-		return;
-
-	size_t count = (size_t)width * height;
-	if (!_chairBlur) {
-		_chairBlur = malloc(count * 4);
-		_chairFine = malloc(count * 4);
-		_chairScore = malloc(count);
-		_chairCut = malloc(count);
-		_chairNear = malloc(count);
-		_chairOpened = malloc(count);
-	}
-
-	// Score a blurred copy of the frame, so the mesh's black threads blend
-	// into its red and the mesh is removed as a whole.
 	CVPixelBufferLockBaseAddress(bgra, kCVPixelBufferLock_ReadOnly);
-	vImage_Buffer src = {
-		.data = CVPixelBufferGetBaseAddress(bgra),
-		.height = height,
-		.width = width,
-		.rowBytes = CVPixelBufferGetBytesPerRow(bgra),
-	};
-	vImage_Buffer blur = {.data = _chairBlur, .height = height, .width = width, .rowBytes = (size_t)width * 4};
-	vImageBoxConvolve_ARGB8888(&src, &blur, NULL, 0, 0, kChairBlur, kChairBlur, NULL, kvImageEdgeExtend);
-	// A lightly blurred copy judges single pixels where the model is sure.
-	vImage_Buffer fine = {.data = _chairFine, .height = height, .width = width, .rowBytes = (size_t)width * 4};
-	vImageBoxConvolve_ARGB8888(&src, &fine, NULL, 0, 0, kChairFineBlur, kChairFineBlur, NULL, kvImageEdgeExtend);
+	const uint8_t *base = CVPixelBufferGetBaseAddress(bgra);
+	size_t width = CVPixelBufferGetWidth(bgra), height = CVPixelBufferGetHeight(bgra);
+	size_t row_bytes = CVPixelBufferGetBytesPerRow(bgra);
+	double sum = 0.0;
+	size_t samples = 0;
+	for (size_t y = 0; y < height; y += kLiftSampleStep) {
+		const uint8_t *row = base + y * row_bytes;
+		for (size_t x = 0; x < width; x += kLiftSampleStep) {
+			const uint8_t *p = row + x * 4;
+			sum += linear[p[0]] + linear[p[1]] + linear[p[2]];
+			samples += 3;
+		}
+	}
 	CVPixelBufferUnlockBaseAddress(bgra, kCVPixelBufferLock_ReadOnly);
 
-	const uint8_t *p = _chairBlur;
-	for (size_t i = 0; i < count; i++, p += 4)
-		_chairScore[i] = (uint8_t)(chair_score(p[2], p[1], p[0]) * 255.0f + 0.5f);
-	// Widen the cut a little, so the chair's edge and black rim go with it.
-	vImage_Buffer score = {.data = _chairScore, .height = height, .width = width, .rowBytes = width};
-	vImage_Buffer cut = {.data = _chairCut, .height = height, .width = width, .rowBytes = width};
-	vImageMax_Planar8(&score, &cut, NULL, 0, 0, kChairRim, kChairRim, kvImageEdgeExtend);
+	float mean = samples ? (float)(sum / (double)samples) : kLiftTarget;
+	float target = fminf(kLiftMax, fmaxf(1.0f, kLiftTarget / fmaxf(mean, 0.0001f)));
+	if (_liftGain < 1.0f)
+		_liftGain = target;
+	_liftGain += (target - _liftGain) * kLiftRate;
+	if (_liftGain < kLiftMinimum)
+		return NULL;
 
-	uint32_t gw = _coreWidth, gh = _coreHeight;
-	for (uint32_t y = 0; y < height; y++) {
-		uint8_t *m = matte + (size_t)y * width;
-		uint8_t *c = _chairCut + (size_t)y * width;
-		const uint8_t *f = _chairFine + (size_t)y * width * 4;
-		const uint8_t *core_row = _core + (size_t)MIN(y / kMotionGridScale, gh - 1) * gw;
-		for (uint32_t x = 0; x < width; x++) {
-			if (core_row[MIN(x / kMotionGridScale, gw - 1)]) {
-				c[x] = 0;
-				continue;
-			}
-			// A partial score already removes most of the pixel, so mesh
-			// that scores only part way still disappears.
-			int amount = MIN(255, (int)c[x] * 3 / 2);
-			// Where the model leans toward the person, the wide blur is not
-			// enough: red smeared onto a black earcup next to the chair
-			// would bite into it. Such pixels are cut only as far as
-			// they look like chair themselves. The mesh's black threads that
-			// survive this are thin and go in the clean-up below.
-			if (m[x] >= kChairSureMatte) {
-				const uint8_t *q = f + (size_t)x * 4;
-				int own = (int)(chair_score(q[2], q[1], q[0]) * 255.0f * 1.5f);
-				amount = MIN(amount, MIN(255, own));
-			}
-			c[x] = (uint8_t)amount;
-			m[x] = (uint8_t)((int)m[x] * (255 - amount) / 255);
+	if (fabsf(_liftGain - _liftTableGain) > 0.01f) {
+		for (int i = 0; i < 256; i++) {
+			float lifted = fminf(1.0f, linear[i] * _liftGain);
+			_liftTable[i] = (Pixel_8)(powf(lifted, 1.0f / 2.2f) * 255.0f + 0.5f);
+			_liftAlpha[i] = (Pixel_8)i;
 		}
+		_liftTableGain = _liftGain;
 	}
 
-	// The chair's black rim is not red, so thin strips of it survive next to
-	// the removed mesh. Close to the cut, take away anything thinner than
-	// kChairSliver pixels (a morphological opening); solid shapes such as a
-	// headphone earcup are left as they are.
-	vImage_Buffer near = {.data = _chairNear, .height = height, .width = width, .rowBytes = width};
-	vImageMax_Planar8(&cut, &near, NULL, 0, 0, kChairCleanupReach, kChairCleanupReach, kvImageEdgeExtend);
-	vImage_Buffer matte_buf = {.data = matte, .height = height, .width = width, .rowBytes = width};
-	vImage_Buffer eroded = {.data = _chairScore, .height = height, .width = width, .rowBytes = width};
-	vImage_Buffer opened = {.data = _chairOpened, .height = height, .width = width, .rowBytes = width};
-	vImageMin_Planar8(&matte_buf, &eroded, NULL, 0, 0, kChairSliver, kChairSliver, kvImageEdgeExtend);
-	vImageMax_Planar8(&eroded, &opened, NULL, 0, 0, kChairSliver, kChairSliver, kvImageEdgeExtend);
-	for (uint32_t y = 0; y < height; y++) {
-		uint8_t *m = matte + (size_t)y * width;
-		const uint8_t *n = _chairNear + (size_t)y * width;
-		const uint8_t *o = _chairOpened + (size_t)y * width;
-		const uint8_t *core_row = _core + (size_t)MIN(y / kMotionGridScale, gh - 1) * gw;
-		for (uint32_t x = 0; x < width; x++) {
-			if (n[x] && o[x] < m[x] && !core_row[MIN(x / kMotionGridScale, gw - 1)])
-				m[x] = o[x];
-		}
-	}
-	_chairMaskValid = YES;
+	CVPixelBufferRef out = NULL;
+	if (CVPixelBufferPoolCreatePixelBuffer(kCFAllocatorDefault, _bgraPool, &out) != kCVReturnSuccess)
+		return NULL;
+	CVPixelBufferLockBaseAddress(bgra, kCVPixelBufferLock_ReadOnly);
+	CVPixelBufferLockBaseAddress(out, 0);
+	vImage_Buffer src = {.data = CVPixelBufferGetBaseAddress(bgra), .height = height, .width = width,
+			     .rowBytes = row_bytes};
+	vImage_Buffer dst = {.data = CVPixelBufferGetBaseAddress(out), .height = height, .width = width,
+			     .rowBytes = CVPixelBufferGetBytesPerRow(out)};
+	// The buffer is BGRA, and the table's channels run in memory order.
+	vImageTableLookUp_ARGB8888(&src, &dst, _liftTable, _liftTable, _liftTable, _liftAlpha, kvImageNoFlags);
+	CVPixelBufferUnlockBaseAddress(out, 0);
+	CVPixelBufferUnlockBaseAddress(bgra, kCVPixelBufferLock_ReadOnly);
+	return out;
 }
 
 - (void)runModelOn:(CVPixelBufferRef)input timestamp:(uint64_t)timestamp
@@ -918,12 +1103,15 @@ static inline float chair_score(int r, int g, int b)
 		return;
 	}
 
+	CVPixelBufferRef lifted = [self newLiftedFrom:bgra];
 	NSMutableDictionary *features = [_states mutableCopy];
-	features[@"src"] = [MLFeatureValue featureValueWithPixelBuffer:bgra];
+	features[@"src"] = [MLFeatureValue featureValueWithPixelBuffer:lifted ? lifted : bgra];
 	NSError *error = nil;
 	MLDictionaryFeatureProvider *provider = [[MLDictionaryFeatureProvider alloc] initWithDictionary:features
 												   error:&error];
 	id<MLFeatureProvider> output = provider ? [_model predictionFromFeatures:provider error:&error] : nil;
+	if (lifted)
+		CVPixelBufferRelease(lifted);
 	if (!output) {
 		CVPixelBufferRelease(bgra);
 		blog_rvm(LOG_WARNING, "Inference failed: %s", error.localizedDescription.UTF8String);
@@ -1051,7 +1239,6 @@ static double smooth_matte(float *smoothed, const uint8_t *incoming, const uint8
 
 	[self updateCoreFrom:_incoming width:width height:height];
 	[self applyPlateTo:_incoming width:width height:height frame:bgra];
-	[self applyChairTo:_incoming width:width height:height frame:bgra];
 
 	// _incoming keeps the unblurred matte, so the flicker statistic measures
 	// what the blur and the steadying take out together.
@@ -1084,7 +1271,7 @@ static double smooth_matte(float *smoothed, const uint8_t *incoming, const uint8
 	if (!_slots[0] || _matteWidth != width || _matteHeight != height) {
 		for (int s = 0; s < MATTE_SLOTS; s++) {
 			free(_slots[s]);
-			_slots[s] = malloc(count * 2);
+			_slots[s] = malloc(count);
 			_slotTimestamps[s] = 0;
 			_slotGenerations[s] = 0;
 		}
@@ -1093,14 +1280,9 @@ static double smooth_matte(float *smoothed, const uint8_t *incoming, const uint8
 	}
 	_matteGeneration++;
 	int slot = (int)(_matteGeneration % MATTE_SLOTS);
-	// Each slot pixel holds the matte and, second, how strongly to remove the
-	// chair's color spill there (only near where the chair was cut).
 	uint8_t *dst = _slots[slot];
-	const uint8_t *spill = _chairMaskValid ? _chairNear : NULL;
-	for (size_t i = 0; i < count; i++) {
-		dst[i * 2] = (uint8_t)(_smoothed[i] + 0.5f);
-		dst[i * 2 + 1] = spill ? spill[i] : 0;
-	}
+	for (size_t i = 0; i < count; i++)
+		dst[i] = (uint8_t)(_smoothed[i] + 0.5f);
 	_slotTimestamps[slot] = timestamp;
 	_slotGenerations[slot] = _matteGeneration;
 	NSString *snapshot = nil;
@@ -1199,11 +1381,13 @@ static float srgb_to_linear(int v)
 	}
 	CVPixelBufferUnlockBaseAddress(bgra, kCVPixelBufferLock_ReadOnly);
 
-	// White balance: make the plain background neutral, keeping green fixed.
+	// White balance: move the plain background toward neutral, keeping green fixed.
 	float balance[3] = {1.0f, 1.0f, 1.0f};
 	if (neutral_n >= (uint64_t)(kAutoBalanceMinShare * (float)total) && neutral[0] > 0 && neutral[2] > 0) {
 		balance[0] = fminf(kAutoBalanceMax, fmaxf(kAutoBalanceMin, (float)(neutral[1] / neutral[0])));
 		balance[2] = fminf(kAutoBalanceMax, fmaxf(kAutoBalanceMin, (float)(neutral[1] / neutral[2])));
+		balance[0] = 1.0f + kAutoBalanceStrength * (balance[0] - 1.0f);
+		balance[2] = 1.0f + kAutoBalanceStrength * (balance[2] - 1.0f);
 	} else {
 		[_colorLock lock];
 		float gain_g = fmaxf(_colorGains[1], 0.01f);
@@ -1344,7 +1528,7 @@ static float srgb_to_linear(int v)
 	if (best < 0)
 		best = newest;
 	if (best >= 0 && _slotGenerations[best] != *generation) {
-		size_t size = (size_t)_matteWidth * _matteHeight * 2;
+		size_t size = (size_t)_matteWidth * _matteHeight;
 		if (*width != _matteWidth || *height != _matteHeight) {
 			*dst = brealloc(*dst, size);
 			*width = _matteWidth;
@@ -1390,37 +1574,19 @@ static void write_gray_png(const uint8_t *data, uint32_t width, uint32_t height,
 }
 
 // Writes the current matte as a grayscale PNG, for checking edge quality
-// without capturing the camera image itself. When chair removal is on, what
-// it cut is written next to it with a "-chair" suffix.
+// without capturing the camera image itself.
 - (void)writeMatteSnapshotTo:(NSString *)path
 {
-	// Copy the matte channel under the lock and encode outside it, so the
-	// video thread never waits for PNG encoding.
+	// Copy the matte under the lock and encode outside it, so the video
+	// thread never waits for PNG encoding.
 	[_matteLock lock];
 	uint32_t width = _matteWidth, height = _matteHeight;
 	size_t count = (size_t)width * height;
 	uint8_t *matte = malloc(count);
-	const uint8_t *slot = _slots[_matteGeneration % MATTE_SLOTS];
-	for (size_t i = 0; i < count; i++)
-		matte[i] = slot[i * 2];
+	memcpy(matte, _slots[_matteGeneration % MATTE_SLOTS], count);
 	[_matteLock unlock];
 	write_gray_png(matte, width, height, path);
 	free(matte);
-	if (_chairMaskValid) {
-		NSString *base = [path stringByDeletingPathExtension];
-		write_gray_png(_chairCut, (uint32_t)_modelWidth, (uint32_t)_modelHeight,
-			       [base stringByAppendingString:@"-chair.png"]);
-		// The chair score of every grid cell, for tuning the color test.
-		// It holds no picture detail beyond redness.
-		size_t grid_count = (size_t)_gridWidth * _gridHeight;
-		uint8_t *score = malloc(grid_count);
-		for (size_t i = 0; i < grid_count; i++) {
-			const uint8_t *p = _gridBGRA + i * 4;
-			score[i] = (uint8_t)(chair_score(p[2], p[1], p[0]) * 255.0f + 0.5f);
-		}
-		write_gray_png(score, _gridWidth, _gridHeight, [base stringByAppendingString:@"-chairscore.png"]);
-		free(score);
-	}
 }
 
 - (void)recordTiming:(double)ms
@@ -1494,6 +1660,14 @@ static void write_gray_png(const uint8_t *data, uint32_t width, uint32_t height,
 @end
 
 struct rvm_filter {
+	int countdown_idle;
+	int countdown_capturing;
+	long countdown_frames;
+	volatile long capture_frames;
+	volatile bool plate_cancel_requested;
+	char *plate_path;
+	volatile long capture_ms;
+	int countdown_label;
 	obs_source_t *context;
 	gs_effect_t *effect;
 	gs_eparam_t *param_matte;
@@ -1534,7 +1708,6 @@ struct rvm_filter {
 	volatile bool plate_capture_requested;
 	volatile bool plate_forget_requested;
 	bool use_plate;
-	bool remove_chair;
 	bool auto_color;
 };
 
@@ -1581,7 +1754,6 @@ static void apply_engine_settings(struct rvm_filter *f)
 	RVMEngine *engine = engine_of(f);
 	engine.stability = f->stability;
 	engine.usePlate = f->use_plate;
-	engine.removeChair = f->remove_chair;
 	engine.autoColor = f->auto_color;
 	// A snapshot waits for a model that is loading, so a switch does not
 	// retire the engine before it writes the snapshot.
@@ -1614,6 +1786,7 @@ static void adopt_ready_engine(struct rvm_filter *f)
 		float state[4];
 		[engine_of(f) getColorState:state];
 		[ready setColorState:state];
+		ready.plateCaptureTime = engine_of(f).plateCaptureTime;
 	}
 	retire_engine(f, false);
 	f->engine = (void *)CFBridgingRetain(ready);
@@ -1634,12 +1807,16 @@ static void load_engine(struct rvm_filter *f, const char *model, long long units
 	if (config_dir)
 		os_mkdirs(config_dir);
 	bfree(config_dir);
-	char *plate_path = obs_module_config_path("background-photo.png");
+	// Each filter has its own photo, so two cameras cannot overwrite each other.
+	char *old_plate_path = obs_module_config_path("background-photo.png");
 
 	NSString *model_path = @(path);
-	NSString *plate = plate_path ? @(plate_path) : nil;
+	NSString *plate = f->plate_path ? @(f->plate_path) : nil;
+	NSFileManager *files = [NSFileManager defaultManager];
+	if (plate && old_plate_path && ![files fileExistsAtPath:plate])
+		[files moveItemAtPath:@(old_plate_path) toPath:plate error:nil];
 	bfree(path);
-	bfree(plate_path);
+	bfree(old_plate_path);
 
 	RVMEngineLoader *loader = loader_of(f);
 	uint64_t request = loader.request + 1;
@@ -1684,7 +1861,6 @@ static void rvm_update(void *data, obs_data_t *settings)
 	f->stability = (float)obs_data_get_double(settings, "edge_stability");
 	f->sync = obs_data_get_bool(settings, "sync_video");
 	f->use_plate = obs_data_get_bool(settings, "use_plate");
-	f->remove_chair = obs_data_get_bool(settings, "remove_chair");
 	f->auto_color = obs_data_get_bool(settings, "auto_color");
 
 	// Only the bundled models and the listed compute units can be used, so a
@@ -1707,13 +1883,13 @@ static void rvm_update(void *data, obs_data_t *settings)
 	// Hidden setting used to check edge quality: writes the next matte as a
 	// PNG with this file name into the plugin's config folder, then clears
 	// itself. Only a plain .png file name is accepted, and never the name of
-	// the saved background photo.
+	// a saved background photo.
 	const char *snapshot = obs_data_get_string(settings, "debug_snapshot");
 	if (snapshot && *snapshot) {
 		NSString *name = @(snapshot);
 		if ([name isEqualToString:name.lastPathComponent] && ![name hasPrefix:@"."] &&
 		    [name.pathExtension.lowercaseString isEqualToString:@"png"] &&
-		    ![name isEqualToString:@"background-photo.png"]) {
+		    ![name.lowercaseString hasPrefix:@"background-photo"]) {
 			bfree(f->snapshot_name);
 			f->snapshot_name = bstrdup(snapshot);
 		} else {
@@ -1729,6 +1905,9 @@ static void *rvm_create(obs_data_t *settings, obs_source_t *context)
 	struct rvm_filter *f = bzalloc(sizeof(*f));
 	f->context = context;
 	f->shown_timestamp = UINT64_MAX;
+	f->capture_ms = -1;
+	NSString *plate_name = [NSString stringWithFormat:@"background-photo-%s.png", obs_source_get_uuid(context)];
+	f->plate_path = obs_module_config_path(plate_name.UTF8String);
 	f->loader = (void *)CFBridgingRetain([RVMEngineLoader new]);
 
 	char *effect_path = obs_module_file("rvm-matting.effect");
@@ -1747,6 +1926,7 @@ static void *rvm_create(obs_data_t *settings, obs_source_t *context)
 	if (!f->effect) {
 		blog_rvm(LOG_ERROR, "Could not load rvm-matting.effect");
 		CFBridgingRelease(f->loader);
+		bfree(f->plate_path);
 		bfree(f);
 		return NULL;
 	}
@@ -1783,6 +1963,7 @@ static void rvm_destroy(void *data)
 	bfree(f->matte_copy);
 	bfree(f->model_name);
 	bfree(f->snapshot_name);
+	bfree(f->plate_path);
 	bfree(f);
 }
 
@@ -1800,10 +1981,18 @@ static struct obs_source_frame *rvm_filter_video(void *data, struct obs_source_f
 	adopt_ready_engine(f);
 	bool accepted = false;
 	if (f->engine) {
+		// Stop any old capture first, so a new request always survives.
+		if (os_atomic_set_bool(&f->plate_forget_requested, false)) {
+			engine_of(f).plateCaptureTime = 0;
+			[engine_of(f) requestPlateForget];
+		}
+		if (os_atomic_set_bool(&f->plate_cancel_requested, false))
+			engine_of(f).plateCaptureTime = 0;
 		if (os_atomic_set_bool(&f->plate_capture_requested, false))
 			[engine_of(f) requestPlateCaptureIn:kPlateCaptureDelaySeconds];
-		if (os_atomic_set_bool(&f->plate_forget_requested, false))
-			[engine_of(f) requestPlateForget];
+		os_atomic_set_long(&f->capture_frames, os_atomic_load_long(&f->capture_frames) + 1);
+		double remaining = [engine_of(f) plateCaptureRemaining];
+		os_atomic_set_long(&f->capture_ms, remaining < 0.0 ? -1 : (long)(remaining * 1000.0));
 		accepted = [engine_of(f) acceptsFrame:frame];
 		[engine_of(f) submitFrame:frame];
 	}
@@ -1863,11 +2052,11 @@ static void rvm_video_render(void *data, gs_effect_t *unused)
 					height:&f->matte_height]) {
 			if (!f->matte_tex || old_width != f->matte_width || old_height != f->matte_height) {
 				gs_texture_destroy(f->matte_tex);
-				f->matte_tex = gs_texture_create(f->matte_width, f->matte_height, GS_R8G8, 1, NULL,
+				f->matte_tex = gs_texture_create(f->matte_width, f->matte_height, GS_R8, 1, NULL,
 								 GS_DYNAMIC);
 			}
 			if (f->matte_tex)
-				gs_texture_set_image(f->matte_tex, f->matte_copy, f->matte_width * 2, false);
+				gs_texture_set_image(f->matte_tex, f->matte_copy, f->matte_width, false);
 		}
 	}
 
@@ -1876,8 +2065,9 @@ static void rvm_video_render(void *data, gs_effect_t *unused)
 		return;
 	}
 
-	// Same color-space handling and premultiplied blending as OBS's own
-	// chroma key filter, so this filter can sit anywhere in a filter chain.
+	// Premultiplied blending and color-space choice as in OBS's own chroma key
+	// filter. Filters that change the picture's size must not come before this
+	// one, because the matte is made from the whole camera frame.
 	const enum gs_color_space preferred_spaces[] = {
 		GS_CS_SRGB,
 		GS_CS_SRGB_16F,
@@ -1916,9 +2106,78 @@ static void rvm_defaults(obs_data_t *settings)
 	obs_data_set_default_double(settings, "alpha_high", 0.75);
 	obs_data_set_default_double(settings, "edge_stability", 0.85);
 	obs_data_set_default_bool(settings, "sync_video", true);
-	obs_data_set_default_bool(settings, "use_plate", true);
-	obs_data_set_default_bool(settings, "remove_chair", false);
+	obs_data_set_default_bool(settings, "use_plate", false);
 	obs_data_set_default_bool(settings, "auto_color", false);
+}
+
+// Plays one countdown tick. A sound that is still playing refuses to start
+// again, so each tick is its own copy, kept alive in a small ring.
+static void rvm_play_tick(void)
+{
+	static NSSound *ticks[8];
+	static int next;
+	NSSound *tick = [[NSSound soundNamed:@"Tink"] copy];
+	ticks[next] = tick;
+	next = (next + 1) % 8;
+	[tick play];
+}
+
+// Counts down on the capture button and with sounds, because whoever clicked
+// has to walk out of view and may not see the screen. countdown_label is 0
+// when idle, -1 after a failed capture, 1 while capturing, and otherwise the
+// seconds left plus 1. Runs on
+// the main queue and stops by itself when the capture has finished.
+static void rvm_countdown_tick(obs_weak_source_t *weak, int ticks, bool started)
+{
+	dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 100 * NSEC_PER_MSEC), dispatch_get_main_queue(), ^{
+		obs_source_t *source = obs_weak_source_get_source(weak);
+		if (!source) {
+			obs_weak_source_release(weak);
+			return;
+		}
+		struct rvm_filter *f = obs_obj_get_data(source);
+		// Forget background photo cancels the countdown.
+		if (f->countdown_label <= 0) {
+			obs_source_release(source);
+			obs_weak_source_release(weak);
+			return;
+		}
+		// The engine belongs to the video thread, so read what it published.
+		long capture_ms = os_atomic_load_long(&f->capture_ms);
+		double remaining = capture_ms < 0 ? -1.0 : (double)capture_ms / 1000.0;
+		bool now_started = started || remaining >= 0.0;
+		bool finished = started && remaining < 0.0;
+
+		// Give up if frames stop, the capture never starts or never ends,
+		// and cancel it so it cannot fire later with someone in view.
+		long frames = os_atomic_load_long(&f->capture_frames);
+		f->countdown_idle = frames == f->countdown_frames ? f->countdown_idle + 1 : 0;
+		f->countdown_frames = frames;
+		f->countdown_capturing += capture_ms == 0;
+		bool abandoned = (!now_started && ticks > 50) || f->countdown_idle > 30 || f->countdown_capturing > 100;
+		if (finished || abandoned) {
+			f->countdown_label = abandoned ? -1 : 0;
+			if (abandoned)
+				blog_rvm(LOG_WARNING, "Background photo capture did not finish");
+			os_atomic_set_bool(&f->plate_capture_requested, false);
+			if (abandoned)
+				os_atomic_set_bool(&f->plate_cancel_requested, true);
+			obs_source_update_properties(source);
+			[[NSSound soundNamed:finished ? @"Glass" : @"Basso"] play];
+			obs_source_release(source);
+			obs_weak_source_release(weak);
+			return;
+		}
+		int label = remaining < 0.0 ? f->countdown_label : (int)ceil(remaining) + 1;
+		if (label != f->countdown_label) {
+			f->countdown_label = label;
+			if (label > 1)
+				rvm_play_tick();
+			obs_source_update_properties(source);
+		}
+		obs_source_release(source);
+		rvm_countdown_tick(weak, ticks + 1, now_started);
+	});
 }
 
 static bool rvm_capture_plate_clicked(obs_properties_t *props, obs_property_t *property, void *data)
@@ -1926,7 +2185,26 @@ static bool rvm_capture_plate_clicked(obs_properties_t *props, obs_property_t *p
 	UNUSED_PARAMETER(props);
 	UNUSED_PARAMETER(property);
 	struct rvm_filter *f = data;
+	if (f->countdown_label > 0)
+		return false; // already counting down or capturing
+
+	// Taking a photo means wanting to use it.
+	obs_data_t *settings = obs_source_get_settings(f->context);
+	if (!obs_data_get_bool(settings, "use_plate")) {
+		obs_data_set_bool(settings, "use_plate", true);
+		obs_source_update(f->context, settings);
+	}
+	obs_data_release(settings);
+
+	os_atomic_set_bool(&f->plate_cancel_requested, false);
+	os_atomic_set_long(&f->capture_ms, -1);
 	os_atomic_set_bool(&f->plate_capture_requested, true);
+	f->countdown_label = (int)kPlateCaptureDelaySeconds + 1;
+	f->countdown_idle = 0;
+	f->countdown_capturing = 0;
+	rvm_play_tick();
+	obs_source_update_properties(f->context);
+	rvm_countdown_tick(obs_source_get_weak_source(f->context), 0, false);
 	return false;
 }
 
@@ -1936,7 +2214,26 @@ static bool rvm_forget_plate_clicked(obs_properties_t *props, obs_property_t *pr
 	UNUSED_PARAMETER(property);
 	struct rvm_filter *f = data;
 	os_atomic_set_bool(&f->plate_forget_requested, true);
+	os_atomic_set_bool(&f->plate_capture_requested, false);
+	f->countdown_label = 0;
+	// Delete it now too, because the engine only acts on the next frame.
+	if (f->plate_path) {
+		NSString *path = @(f->plate_path);
+		NSFileManager *files = [NSFileManager defaultManager];
+		[files removeItemAtPath:path error:nil];
+		[files removeItemAtPath:[path stringByAppendingString:@".noise"] error:nil];
+	}
+	obs_source_update_properties(f->context);
 	return false;
+}
+
+// Sets a property's "?" tooltip. OBS shows plain text on one long line, but
+// word-wraps rich text.
+static void rvm_set_help(obs_property_t *property, const char *key)
+{
+	char text[1024];
+	snprintf(text, sizeof(text), "<qt>%s</qt>", obs_module_text(key));
+	obs_property_set_long_description(property, text);
 }
 
 static obs_properties_t *rvm_properties(void *data)
@@ -1955,26 +2252,43 @@ static obs_properties_t *rvm_properties(void *data)
 	obs_property_list_add_int(units, obs_module_text("ComputeUnits.GPU"), MLComputeUnitsCPUAndGPU);
 	obs_property_list_add_int(units, obs_module_text("ComputeUnits.All"), MLComputeUnitsAll);
 
-	obs_properties_add_float_slider(props, "alpha_low", obs_module_text("AlphaLow"), 0.0, 0.5, 0.01);
-	obs_properties_add_float_slider(props, "alpha_high", obs_module_text("AlphaHigh"), 0.5, 1.0, 0.01);
+	rvm_set_help(model, "Model.Description");
+	rvm_set_help(units, "ComputeUnits.Description");
+	obs_property_t *low = obs_properties_add_float_slider(props, "alpha_low", obs_module_text("AlphaLow"), 0.0, 0.5,
+							      0.01);
+	rvm_set_help(low, "AlphaLow.Description");
+	obs_property_t *high = obs_properties_add_float_slider(props, "alpha_high", obs_module_text("AlphaHigh"), 0.5,
+							       1.0, 0.01);
+	rvm_set_help(high, "AlphaHigh.Description");
 	obs_property_t *stability = obs_properties_add_float_slider(props, "edge_stability",
 								     obs_module_text("EdgeStability"), 0.0, 1.0, 0.05);
-	obs_property_set_long_description(stability, obs_module_text("EdgeStability.Description"));
+	rvm_set_help(stability, "EdgeStability.Description");
 	obs_property_t *sync = obs_properties_add_bool(props, "sync_video", obs_module_text("SyncVideo"));
-	obs_property_set_long_description(sync, obs_module_text("SyncVideo.Description"));
+	rvm_set_help(sync, "SyncVideo.Description");
 
 	obs_property_t *auto_color = obs_properties_add_bool(props, "auto_color", obs_module_text("AutoColor"));
-	obs_property_set_long_description(auto_color, obs_module_text("AutoColor.Description"));
+	rvm_set_help(auto_color, "AutoColor.Description");
 
-	obs_property_t *remove_chair = obs_properties_add_bool(props, "remove_chair", obs_module_text("RemoveChair"));
-	obs_property_set_long_description(remove_chair, obs_module_text("RemoveChair.Description"));
 
 	obs_property_t *use_plate = obs_properties_add_bool(props, "use_plate", obs_module_text("UsePlate"));
-	obs_property_set_long_description(use_plate, obs_module_text("UsePlate.Description"));
-	obs_properties_add_button2(props, "capture_plate", obs_module_text("CapturePlate"), rvm_capture_plate_clicked,
-				   data);
-	obs_properties_add_button2(props, "forget_plate", obs_module_text("ForgetPlate"), rvm_forget_plate_clicked,
-				   data);
+	rvm_set_help(use_plate, "UsePlate.Description");
+	const struct rvm_filter *filter = data;
+	char capture_text[128];
+	if (filter && filter->countdown_label > 1)
+		snprintf(capture_text, sizeof(capture_text), "%s %d", obs_module_text("CapturePlateCountdown"),
+			 filter->countdown_label - 1);
+	else if (filter && filter->countdown_label == 1)
+		snprintf(capture_text, sizeof(capture_text), "%s", obs_module_text("CapturePlateRunning"));
+	else if (filter && filter->countdown_label < 0)
+		snprintf(capture_text, sizeof(capture_text), "%s", obs_module_text("CapturePlateFailed"));
+	else
+		snprintf(capture_text, sizeof(capture_text), "%s", obs_module_text("CapturePlate"));
+	obs_property_t *capture =
+		obs_properties_add_button2(props, "capture_plate", capture_text, rvm_capture_plate_clicked, data);
+	rvm_set_help(capture, "CapturePlate.Description");
+	obs_property_t *forget = obs_properties_add_button2(props, "forget_plate", obs_module_text("ForgetPlate"),
+							    rvm_forget_plate_clicked, data);
+	rvm_set_help(forget, "ForgetPlate.Description");
 	return props;
 }
 

@@ -18,7 +18,8 @@ Usage:
 
 RVM_REPO is a checkout of https://github.com/PeterL1n/RobustVideoMatting and
 WEIGHTS.pth is rvm_mobilenetv3.pth or rvm_resnet50.pth from its v1.0.0
-release. build.sh runs this script for both variants.
+release, or weights fine-tuned from them. build.sh runs
+this script for both variants.
 """
 
 import argparse
