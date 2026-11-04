@@ -2,9 +2,7 @@
 // Copyright (C) 2026 Aditya Kar
 //
 // Multiplies the source by the RVM alpha matte. The source arrives
-// premultiplied, so scaling all four channels keeps it premultiplied. The
-// matte texture's second channel marks where to remove the chair's color
-// spill.
+// premultiplied, so scaling all four channels keeps it premultiplied.
 
 uniform float4x4 ViewProj;
 uniform texture2d image;
@@ -57,16 +55,7 @@ float3 apply_color(float3 rgb)
 float4 PSMatte(VertData v_in) : TARGET
 {
 	float4 rgba = image.Sample(textureSampler, v_in.uv);
-	float2 m = matte.Sample(textureSampler, v_in.uv).rg;
-	float a = smoothstep(alpha_low, alpha_high, m.r);
-
-	// Near a removed chair, leftover pixels with the chair's magenta tint
-	// (more blue than green) have their red pulled down to their other
-	// channels, so they read as neutral shadow rather than a red fringe.
-	// Skin has more green than blue and is left alone.
-	float magenta = saturate((rgba.b - rgba.g) * 8.0);
-	float neutral_red = min(rgba.r, max(rgba.g, rgba.b));
-	rgba.r = lerp(rgba.r, neutral_red, m.g * magenta);
+	float a = smoothstep(alpha_low, alpha_high, matte.Sample(textureSampler, v_in.uv).r);
 
 	// The camera image is opaque here, but undo any premultiplication so the
 	// color math sees true colors.
